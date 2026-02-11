@@ -1,0 +1,105 @@
+using System;
+using System.Data.Odbc;
+using Newtonsoft.Json.Linq;
+
+string resultJson = "";
+
+// Required
+string settlementId = InputJson["settlementId"]?.ToString();
+
+// Optional
+int? limitRows = InputJson["limit"]?.ToObject<int?>();
+int limit = (limitRows.HasValue && limitRows.Value > 0) ? limitRows.Value : 300;
+
+// Optional filters
+string txnTypesCsv = InputJson["txn_types_csv"]?.ToString();
+string amountDescLike = InputJson["amount_desc_like"]?.ToString();
+
+settlementId = (settlementId ?? "").Trim();
+txnTypesCsv = (txnTypesCsv ?? "").Trim();
+amountDescLike = (amountDescLike ?? "").Trim();
+
+// Validate required param
+if (string.IsNullOrWhiteSpace(settlementId))
+{
+    return new JObject
+    {
+        ["id"] = -400,
+        ["Message"] = "Parameter 'settlementId' is required. Example: { \"settlementId\": \"23405515541\", \"limit\": 300 }"
+    };
+}
+
+using (var connection = new OdbcConnection("{ConnectionString}"))
+{
+    connection.Open();
+
+    // SP signature:
+    // (p_settlement_id, limit_rows, p_txn_types_csv, p_amount_desc_like)
+    using (var command = new OdbcCommand("{ CALL \"CTS_EXCEPTIONS_SETTLEMENT_DETAIL\"( ?, ?, ?, ? ) }", connection))
+    {
+        command.Parameters.Add("p_settlement_id", OdbcType.VarChar).Value = settlementId;
+        command.Parameters.Add("limit_rows", OdbcType.Int).Value = limit;
+
+        // If empty string, send NULL so SP treats it as no-filter
+        if (string.IsNullOrWhiteSpace(txnTypesCsv))
+            command.Parameters.Add("p_txn_types_csv", OdbcType.VarChar).Value = DBNull.Value;
+        else
+            command.Parameters.Add("p_txn_types_csv", OdbcType.VarChar).Value = txnTypesCsv;
+
+        if (string.IsNullOrWhiteSpace(amountDescLike))
+            command.Parameters.Add("p_amount_desc_like", OdbcType.VarChar).Value = DBNull.Value;
+        else
+            command.Parameters.Add("p_amount_desc_like", OdbcType.VarChar).Value = amountDescLike;
+
+        using (var reader = command.ExecuteReader())
+        {
+            if (reader.Read())
+            {
+                // NCLOB-safe read
+                resultJson = reader[0]?.ToString();
+            }
+        }
+    }
+}
+
+// Validate response
+if (string.IsNullOrWhiteSpace(resultJson))
+{
+    return new JObject
+    {
+        ["id"] = -500,
+        ["Message"] = "SP no devolvió datos."
+    };
+}
+
+// SP returns already a JSON object string (with meta/summary/rows etc.)
+try
+{
+    return JObject.Parse(resultJson);
+}
+catch
+{
+    // if SP returns an array or invalid json, fail gracefully
+    try
+    {
+        return new JObject { ["rows"] = JArray.Parse(resultJson) };
+    }
+    catch
+    {
+        return new JObject
+        {
+            ["id"] = -501,
+            ["Message"] = "SP devolvió un JSON inválido."
+        };
+    }
+}
+
+{
+  "engine": "Worker",
+  "settlementId": "23405515541",
+  "limit": 300,
+  "txn_types_csv": "AmazonFees,FBAFees,other-transaction",
+  "amount_desc_like": "Reserve"
+}
+
+

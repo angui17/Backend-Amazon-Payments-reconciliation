@@ -1,0 +1,316 @@
+// UploadPaymentInfo.csx - Procesa archivos TSV de liquidación e inserta en BD
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlClient;
+using System.IO;
+using System.Threading.Tasks;
+using System.Web;
+using SAPbobsCOM;
+
+public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
+{
+    log.Info("C# HTTP trigger function started - UploadPaymentInfo");
+
+    try
+    {
+        string sqlConnectionString = Environment.GetEnvironmentVariable("SqlConnectionString");
+        string sapConnectionString = Environment.GetEnvironmentVariable("SapConnectionString");
+        
+        var directoryPath = Path.Combine(Path.GetTempPath(), "AmazonReports", "SettlementReport");
+        var processedPath = Path.Combine(directoryPath, "Processed");
+        Directory.CreateDirectory(processedPath);
+
+        // Obtener último payment ID procesado
+        string lastPaymentID = await GetLastPaymentID(sqlConnectionString, log);
+        
+        var filePaths = Directory.GetFiles(directoryPath, "*.tsv");
+        if (filePaths.Length == 0)
+        {
+            return new { message = "No TSV files found to process" };
+        }
+
+        int processedFiles = 0;
+        int totalRows = 0;
+
+        foreach (var filePath in filePaths)
+        {
+            var lines = File.ReadAllLines(filePath);
+            if (lines.Length < 2) continue;
+
+            var fileID = lines[1].Split('	')[0];
+
+            // Verificar si ya fue procesado
+            if (!string.IsNullOrEmpty(lastPaymentID) && fileID == lastPaymentID)
+            {
+                log.Info($"File {Path.GetFileName(filePath)} already processed. Skipping...");
+                MoveToProcessed(filePath, processedPath, log);
+                continue;
+            }
+
+            log.Info($"Processing file: {Path.GetFileName(filePath)}");
+            int rowsProcessed = await ProcessFile(filePath, sqlConnectionString, sapConnectionString, log, lastPaymentID);
+            
+            MoveToProcessed(filePath, processedPath, log);
+            processedFiles++;
+            totalRows += rowsProcessed;
+            
+            log.Info($"File {Path.GetFileName(filePath)} processed with {rowsProcessed} rows");
+        }
+
+        return new { 
+            success = true, 
+            processedFiles = processedFiles,
+            totalRows = totalRows,
+            message = $"Processed {processedFiles} files with {totalRows} total rows"
+        };
+    }
+    catch (Exception ex)
+    {
+        log.Error($"Error in UploadPaymentInfo: {ex.Message}", ex);
+        return new { error = ex.Message };
+    }
+}
+
+// MÉTODOS AUXILIARES
+private static async Task<string> GetLastPaymentID(string sqlConnectionString, TraceWriter log)
+{
+    try
+    {
+        using (var connection = new SqlConnection(sqlConnectionString))
+        {
+            await connection.OpenAsync();
+            using (var command = new SqlCommand("CALL CTS_AMAZON_LAST_PAYMENT_ID()", connection))
+            using (var reader = await command.ExecuteReaderAsync())
+            {
+                if (await reader.ReadAsync())
+                {
+                    return reader["id"]?.ToString();
+                }
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        log.Warning($"Error getting last payment ID: {ex.Message}");
+    }
+    return null;
+}
+
+private static async Task<int> ProcessFile(string filePath, string sqlConnectionString, string sapConnectionString, TraceWriter log, string lastPaymentID)
+{
+    var lines = File.ReadAllLines(filePath);
+    if (lines.Length < 2) return 0;
+
+    var headerColumns = lines[1].Split('	');
+    var settlementStartDate = headerColumns[1];
+    var settlementEndDate = headerColumns[2];
+    var depositDate = headerColumns[3];
+    var totalAmount = Convert.ToDecimal(headerColumns[4]);
+    var fileID = headerColumns[0];
+
+    // Verificar si ya fue procesado
+    if (!string.IsNullOrEmpty(lastPaymentID) && fileID == lastPaymentID)
+    {
+        log.Info($"File {Path.GetFileName(filePath)} already processed. Skipping...");
+        return 0;
+    }
+
+    var relevantLines = lines.Skip(2).ToList();
+    int processedRows = 0;
+
+    using (var sqlConnection = new SqlConnection(sqlConnectionString))
+    {
+        await sqlConnection.OpenAsync();
+
+        foreach (var line in relevantLines)
+        {
+            var columns = line.Split('	');
+            if (columns.Length < 22) continue;
+
+            var id = columns[0];
+            var transactionType = columns[6];
+            
+            // Saltar tipos de transacción no deseados
+            if (transactionType == "Grade and Resolve Fees") continue;
+
+            var orderId = string.IsNullOrEmpty(columns[7]) ? "N/A" : columns[7];
+            var amountDescription = columns[13];
+            var amount = Math.Round(Convert.ToDecimal(columns[14]), 2);
+            var postedDate = columns[17];
+            var sku = columns[18];
+            var orderitem = columns[21];
+
+            // Insertar en base de datos
+            string sql = @"
+                CALL CTS_AMAZON_DATA_PAYMENT_ADD(
+                    'P', @id, @transactionType, @orderId, @amountDescription, 
+                    @amount, @postedDate, @settlementStartDate, @settlementEndDate, 
+                    @depositDate, @totalAmount, @sku, @orderitem
+                )";
+
+            using (var command = new SqlCommand(sql, sqlConnection))
+            {
+                command.Parameters.AddWithValue("@id", id);
+                command.Parameters.AddWithValue("@transactionType", transactionType);
+                command.Parameters.AddWithValue("@orderId", orderId);
+                command.Parameters.AddWithValue("@amountDescription", amountDescription);
+                command.Parameters.AddWithValue("@amount", amount);
+                command.Parameters.AddWithValue("@postedDate", postedDate);
+                command.Parameters.AddWithValue("@settlementStartDate", settlementStartDate);
+                command.Parameters.AddWithValue("@settlementEndDate", settlementEndDate);
+                command.Parameters.AddWithValue("@depositDate", depositDate);
+                command.Parameters.AddWithValue("@totalAmount", totalAmount);
+                command.Parameters.AddWithValue("@sku", sku);
+                command.Parameters.AddWithValue("@orderitem", orderitem);
+
+                await command.ExecuteNonQueryAsync();
+                processedRows++;
+            }
+
+            // Crear asiento contable para transacciones especiales
+            if (transactionType == "other-transaction" &&
+                (amountDescription == "Previous Reserve Amount Balance" ||
+                 amountDescription == "Current Reserve Amount"))
+            {
+                bool isDebit = amount > 0;
+                await CreateCustomerJournalEntry(
+                    Convert.ToDouble(amount),
+                    "C000138",
+                    "1113",
+                    depositDate,
+                    amountDescription,
+                    id,
+                    isDebit,
+                    sapConnectionString,
+                    log
+                );
+            }
+        }
+    }
+
+    return processedRows;
+}
+
+private static async Task CreateCustomerJournalEntry(double amount, string customerCode, string accountCode, 
+    string entryDate, string journalMemo, string docID, bool isDebit, string sapConnectionString, TraceWriter log)
+{
+    try
+    {
+        // Conectar a SAP Business One
+        Company company = new Company();
+        ConfigureSAPConnection(company, sapConnectionString);
+        
+        int ret = company.Connect();
+        if (ret != 0)
+        {
+            log.Error($"SAP connection failed: {company.GetLastErrorDescription()}");
+            return;
+        }
+
+        JournalEntries journalEntry = (JournalEntries)company.GetBusinessObject(BoObjectTypes.oJournalEntries);
+        
+        // Configurar fechas
+        entryDate = entryDate.Substring(0, 10);
+        DateTime parsedDate = DateTime.ParseExact(entryDate, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+        
+        journalEntry.ReferenceDate = parsedDate;
+        journalEntry.TaxDate = parsedDate;
+        journalEntry.DueDate = parsedDate;
+        journalEntry.Memo = journalMemo;
+        journalEntry.UserFields.Fields.Item("U_CTS_SettlementID").Value = docID;
+
+        double value = isDebit ? amount : amount * (-1);
+
+        // Línea 1 - Cliente
+        journalEntry.Lines.ShortName = customerCode;
+        journalEntry.Lines.AccountCode = "1110";
+        journalEntry.Lines.Debit = isDebit ? value : 0;
+        journalEntry.Lines.Credit = isDebit ? 0 : value;
+        journalEntry.Lines.Add();
+
+        // Línea 2 - Cuenta contable
+        journalEntry.Lines.AccountCode = accountCode;
+        journalEntry.Lines.Debit = isDebit ? 0 : value;
+        journalEntry.Lines.Credit = isDebit ? value : 0;
+
+        if (journalEntry.Add() != 0)
+        {
+            log.Error($"Journal entry creation failed: {company.GetLastErrorDescription()}");
+        }
+        else
+        {
+            log.Info("Journal entry created successfully");
+        }
+
+        company.Disconnect();
+    }
+    catch (Exception ex)
+    {
+        log.Error($"Error creating journal entry: {ex.Message}");
+    }
+}
+
+private static void ConfigureSAPConnection(Company company, string connectionString)
+{
+    // Parsear connection string y configurar compañía
+    // Ejemplo: "Server=COPAHANA:30015;CompanyDB=SBO_COPA_LIVE;UserName=manager;Password=SAP2018;DbUserName=SYSTEM;DbPassword=SAPB1Admin"
+    var parameters = connectionString.Split(';');
+    foreach (var param in parameters)
+    {
+        var keyValue = param.Split('=');
+        if (keyValue.Length == 2)
+        {
+            switch (keyValue[0].ToLower())
+            {
+                case "server":
+                    company.Server = keyValue[1];
+                    break;
+                case "companydb":
+                    company.CompanyDB = keyValue[1];
+                    break;
+                case "username":
+                    company.UserName = keyValue[1];
+                    break;
+                case "password":
+                    company.Password = keyValue[1];
+                    break;
+                case "dbusername":
+                    company.DbUserName = keyValue[1];
+                    break;
+                case "dbpassword":
+                    company.DbPassword = keyValue[1];
+                    break;
+            }
+        }
+    }
+    
+    company.LicenseServer = "COPAHANA:40000";
+    company.language = SAPbobsCOM.BoSuppLangs.ln_English;
+    company.DbServerType = SAPbobsCOM.BoDataServerTypes.dst_HANADB;
+}
+
+private static void MoveToProcessed(string filePath, string processedPath, TraceWriter log)
+{
+    try
+    {
+        var fileName = Path.GetFileName(filePath);
+        var targetPath = Path.Combine(processedPath, fileName);
+
+        if (File.Exists(targetPath))
+        {
+            string newFileName = $"{Path.GetFileNameWithoutExtension(fileName)}_{DateTime.Now:yyyyMMdd_HHmmss}{Path.GetExtension(fileName)}";
+            targetPath = Path.Combine(processedPath, newFileName);
+        }
+
+        File.Move(filePath, targetPath);
+    }
+    catch (Exception ex)
+    {
+        log.Error($"Error moving file {filePath}: {ex.Message}");
+    }
+}
+{ 
+  "engine": "Worker", 
+  "name": "World"
+}

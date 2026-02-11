@@ -1,0 +1,399 @@
+using System;
+using System.Data.Odbc;
+using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
+using Newtonsoft.Json.Linq;
+
+string GetStr(string k, string def = "")
+{
+    if (InputJson == null) return def;
+    var t = InputJson[k];
+    if (t == null || t.Type == JTokenType.Null) return def;
+    var s = t.ToString();
+    return string.IsNullOrWhiteSpace(s) ? def : s.Trim();
+}
+int GetInt(string k, int def)
+{
+    if (InputJson == null) return def;
+    var t = InputJson[k];
+    if (t == null || t.Type == JTokenType.Null) return def;
+    int v; return int.TryParse(t.ToString(), out v) ? v : def;
+}
+
+string lwaClientId     = GetStr("lwa_client_id");
+string lwaClientSecret = GetStr("lwa_client_secret");
+string lwaRefreshToken = GetStr("lwa_refresh_token");
+
+string awsAccessKey    = GetStr("aws_access_key");
+string awsSecretKey    = GetStr("aws_secret_key");
+string awsSessionToken = GetStr("aws_session_token", null);
+
+string region          = GetStr("region", "us-east-1");
+string host            = GetStr("spapi_host", "sellingpartnerapi-na.amazon.com");
+
+string reportType      = GetStr("report_type", "GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2");
+string createdSince    = GetStr("created_since", null);
+int maxReports         = GetInt("max_reports", 20);
+
+if (string.IsNullOrWhiteSpace(lwaClientId) ||
+    string.IsNullOrWhiteSpace(lwaClientSecret) ||
+    string.IsNullOrWhiteSpace(lwaRefreshToken))
+{
+    return new JObject {
+        ["id"] = -400,
+        ["Message"] = "Missing LWA credentials. Required: lwa_client_id, lwa_client_secret, lwa_refresh_token."
+    };
+}
+if (string.IsNullOrWhiteSpace(awsAccessKey) || string.IsNullOrWhiteSpace(awsSecretKey))
+{
+    return new JObject {
+        ["id"] = -401,
+        ["Message"] = "Missing AWS credentials for SigV4. Required: aws_access_key, aws_secret_key. Optional: aws_session_token."
+    };
+}
+
+// ---- LWA token (NO dynamic) ----
+async System.Threading.Tasks.Task<string> GetLwaAccessToken()
+{
+    using (var client = new HttpClient())
+    {
+        var body = new FormUrlEncodedContent(new[] {
+            new System.Collections.Generic.KeyValuePair<string,string>("grant_type","refresh_token"),
+            new System.Collections.Generic.KeyValuePair<string,string>("refresh_token", lwaRefreshToken),
+            new System.Collections.Generic.KeyValuePair<string,string>("client_id", lwaClientId),
+            new System.Collections.Generic.KeyValuePair<string,string>("client_secret", lwaClientSecret),
+        });
+
+        var resp = await client.PostAsync("https://api.amazon.com/auth/o2/token", body);
+        var txt = await resp.Content.ReadAsStringAsync();
+        if (!resp.IsSuccessStatusCode) throw new Exception("LWA token error: " + txt);
+
+        var jo = JObject.Parse(txt);
+        var token = (string)jo["access_token"];
+        if (string.IsNullOrWhiteSpace(token))
+            throw new Exception("LWA token response missing access_token: " + txt);
+
+        return token;
+    }
+}
+
+// ---- SigV4 signer ----
+byte[] HmacSHA256(byte[] key, string data)
+{
+    using (var hmac = new HMACSHA256(key))
+        return hmac.ComputeHash(Encoding.UTF8.GetBytes(data));
+}
+string ToHex(byte[] bytes)
+{
+    var sb = new StringBuilder(bytes.Length * 2);
+    foreach (var b in bytes) sb.Append(b.ToString("x2"));
+    return sb.ToString();
+}
+byte[] Sha256Bytes(string data)
+{
+    using (var sha = SHA256.Create())
+        return sha.ComputeHash(Encoding.UTF8.GetBytes(data));
+}
+string Sha256Hex(string data) => ToHex(Sha256Bytes(data));
+
+string SignSigV4(string method, string canonicalUri, string queryString, string payload, string amzDate, string dateStamp)
+{
+    var canonicalHeaders = new StringBuilder();
+    canonicalHeaders.Append("host:").Append(host).Append("
+");
+    canonicalHeaders.Append("x-amz-date:").Append(amzDate).Append("
+");
+    if (!string.IsNullOrWhiteSpace(awsSessionToken))
+        canonicalHeaders.Append("x-amz-security-token:").Append(awsSessionToken).Append("
+");
+
+    string signedHeaders = string.IsNullOrWhiteSpace(awsSessionToken)
+        ? "host;x-amz-date"
+        : "host;x-amz-date;x-amz-security-token";
+
+    string payloadHash = Sha256Hex(payload ?? "");
+
+    string canonicalRequest =
+        method + "
+" +
+        canonicalUri + "
+" +
+        (queryString ?? "") + "
+" +
+        canonicalHeaders.ToString() + "
+" +
+        signedHeaders + "
+" +
+        payloadHash;
+
+    string algorithm = "AWS4-HMAC-SHA256";
+    string credentialScope = $"{dateStamp}/{region}/execute-api/aws4_request";
+    string stringToSign =
+        algorithm + "
+" +
+        amzDate + "
+" +
+        credentialScope + "
+" +
+        Sha256Hex(canonicalRequest);
+
+    byte[] kSecret = Encoding.UTF8.GetBytes("AWS4" + awsSecretKey);
+    byte[] kDate = HmacSHA256(kSecret, dateStamp);
+    byte[] kRegion = HmacSHA256(kDate, region);
+    byte[] kService = HmacSHA256(kRegion, "execute-api");
+    byte[] kSigning = HmacSHA256(kService, "aws4_request");
+    byte[] sigBytes = HmacSHA256(kSigning, stringToSign);
+    string signature = ToHex(sigBytes);
+
+    return $"{algorithm} Credential={awsAccessKey}/{credentialScope}, SignedHeaders={signedHeaders}, Signature={signature}";
+}
+
+async System.Threading.Tasks.Task<HttpResponseMessage> SpApiGet(string path, string query, string lwaToken)
+{
+    string amzDate = DateTime.UtcNow.ToString("yyyyMMddTHHmmssZ");
+    string dateStamp = DateTime.UtcNow.ToString("yyyyMMdd");
+
+    string payload = "";
+    string auth = SignSigV4("GET", path, query, payload, amzDate, dateStamp);
+
+    string uri = "https://" + host + path + (string.IsNullOrEmpty(query) ? "" : "?" + query);
+
+    var req = new HttpRequestMessage(HttpMethod.Get, uri);
+    req.Headers.TryAddWithoutValidation("x-amz-access-token", lwaToken);
+    req.Headers.TryAddWithoutValidation("x-amz-date", amzDate);
+    req.Headers.TryAddWithoutValidation("Authorization", auth);
+    if (!string.IsNullOrWhiteSpace(awsSessionToken))
+        req.Headers.TryAddWithoutValidation("x-amz-security-token", awsSessionToken);
+
+    using (var client = new HttpClient())
+        return await client.SendAsync(req);
+}
+
+async System.Threading.Tasks.Task<byte[]> DownloadBytes(string url)
+{
+    using (var client = new HttpClient())
+    {
+        var resp = await client.GetAsync(url);
+        var bytes = await resp.Content.ReadAsByteArrayAsync();
+        if (!resp.IsSuccessStatusCode)
+            throw new Exception("Download report file error: " + Encoding.UTF8.GetString(bytes));
+        return bytes;
+    }
+}
+
+string SafeCreatedSince(string s)
+{
+    if (!string.IsNullOrWhiteSpace(s)) return s;
+    return DateTime.UtcNow.AddDays(-30).ToString("yyyy-MM-ddTHH:mm:ssZ");
+}
+
+bool IsAlreadyProcessed(string reportId)
+{
+    using (var conn = new OdbcConnection("{ConnectionString}"))
+    {
+        conn.Open();
+        using (var cmd = new OdbcCommand(@"
+SELECT COUNT(*) AS C
+FROM ""CTS_SPAPI_REPORT_LOG""
+WHERE ""reportId"" = ? AND IFNULL(""processingStatus"",'') IN ('STAGED','LOADED')
+", conn))
+        {
+            cmd.Parameters.Add("reportId", OdbcType.NVarChar).Value = reportId;
+            var o = cmd.ExecuteScalar();
+            int c = 0; int.TryParse(Convert.ToString(o), out c);
+            return c > 0;
+        }
+    }
+}
+
+int InsertStageLines(string reportId, string tsvText)
+{
+    var lines = tsvText.Split(new[] { "
+", "
+" }, StringSplitOptions.None);
+    if (lines.Length < 3) return 0;
+
+    var headerCols = lines[1].Split('	');
+    if (headerCols.Length < 5) return 0;
+
+    string settlementId = headerCols[0];
+    string settlementStartDate = headerCols[1];
+    string settlementEndDate = headerCols[2];
+    string depositDate = headerCols[3];
+    decimal totalAmount = 0m;
+    decimal.TryParse(headerCols[4], out totalAmount);
+
+    int inserted = 0;
+
+    using (var conn = new OdbcConnection("{ConnectionString}"))
+    {
+        conn.Open();
+
+        // MERGE log
+        using (var logCmd = new OdbcCommand(@"
+MERGE INTO ""CTS_SPAPI_REPORT_LOG"" T
+USING (SELECT ? AS ""reportId"" FROM DUMMY) S
+ON (T.""reportId"" = S.""reportId"")
+WHEN NOT MATCHED THEN
+  INSERT (""reportId"", ""processedAt"", ""processingStatus"", ""linesInserted"")
+  VALUES (?, CURRENT_UTCTIMESTAMP, 'DOWNLOADED', 0)
+WHEN MATCHED THEN
+  UPDATE SET ""processedAt"" = CURRENT_UTCTIMESTAMP, ""processingStatus""='DOWNLOADED'
+", conn))
+        {
+            logCmd.Parameters.Add("p1", OdbcType.NVarChar).Value = reportId;
+            logCmd.Parameters.Add("p2", OdbcType.NVarChar).Value = reportId;
+            logCmd.ExecuteNonQuery();
+        }
+
+        for (int i = 2; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            var c = line.Split('	');
+            if (c.Length < 22) continue;
+
+            string id = c[0];
+            string transactionType = c[6];
+            if (transactionType == "Grade and Resell Fees") continue;
+
+            string orderId = string.IsNullOrWhiteSpace(c[7]) ? "N/A" : c[7];
+            string amountDescription = c[13];
+            decimal amount = 0m;
+            decimal.TryParse(c[14], out amount);
+            amount = Math.Round(amount, 2);
+
+            string postedDate = c[17];
+            string sku = c[18];
+            string orderItem = c[21];
+
+            using (var cmd = new OdbcCommand(@"
+INSERT INTO ""CTS_SPAPI_INPAYMENTS_STAGE""
+(""reportId"",""settlementId"",""transactionType"",""orderId"",""amountDescription"",""amount"",
+ ""postedDate"",""settlementStartDate"",""settlementEndDate"",""depositDate"",""totalAmount"",
+ ""sku"",""orderItem"",""rawLine"")
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+", conn))
+            {
+                cmd.Parameters.Add("reportId", OdbcType.NVarChar).Value = reportId;
+                cmd.Parameters.Add("settlementId", OdbcType.NVarChar).Value = settlementId;
+                cmd.Parameters.Add("transactionType", OdbcType.NVarChar).Value = transactionType;
+                cmd.Parameters.Add("orderId", OdbcType.NVarChar).Value = orderId;
+                cmd.Parameters.Add("amountDescription", OdbcType.NVarChar).Value = amountDescription;
+                cmd.Parameters.Add("amount", OdbcType.Decimal).Value = amount;
+                cmd.Parameters.Add("postedDate", OdbcType.NVarChar).Value = postedDate;
+                cmd.Parameters.Add("settlementStartDate", OdbcType.NVarChar).Value = settlementStartDate;
+                cmd.Parameters.Add("settlementEndDate", OdbcType.NVarChar).Value = settlementEndDate;
+                cmd.Parameters.Add("depositDate", OdbcType.NVarChar).Value = depositDate;
+                cmd.Parameters.Add("totalAmount", OdbcType.Decimal).Value = totalAmount;
+                cmd.Parameters.Add("sku", OdbcType.NVarChar).Value = sku ?? "";
+                cmd.Parameters.Add("orderItem", OdbcType.NVarChar).Value = orderItem ?? "";
+                cmd.Parameters.Add("rawLine", OdbcType.NVarChar).Value = line;
+                cmd.ExecuteNonQuery();
+                inserted++;
+            }
+        }
+
+        using (var upd = new OdbcCommand(@"
+UPDATE ""CTS_SPAPI_REPORT_LOG""
+SET ""linesInserted"" = ?, ""processingStatus""='STAGED'
+WHERE ""reportId"" = ?
+", conn))
+        {
+            upd.Parameters.Add("linesInserted", OdbcType.Int).Value = inserted;
+            upd.Parameters.Add("reportId", OdbcType.NVarChar).Value = reportId;
+            upd.ExecuteNonQuery();
+        }
+    }
+
+    return inserted;
+}
+
+try
+{
+    var lwaToken = await GetLwaAccessToken();
+
+    string qs = "reportTypes=" + Uri.EscapeDataString(reportType) +
+                "&createdSince=" + Uri.EscapeDataString(SafeCreatedSince(createdSince));
+
+    var listResp = await SpApiGet("/reports/2021-06-30/reports", qs, lwaToken);
+    var listTxt = await listResp.Content.ReadAsStringAsync();
+    if (!listResp.IsSuccessStatusCode)
+        return new JObject { ["id"]=-500, ["Message"]="SP-API list reports error", ["detail"]=listTxt };
+
+    var listJson = JObject.Parse(listTxt);
+    var reports = (JArray)(listJson["reports"] ?? new JArray());
+
+    int processed = 0;
+    int stagedLines = 0;
+
+    foreach (var r in reports)
+    {
+        if (processed >= maxReports) break;
+
+        var reportId = (string)r["reportId"];
+        var reportDocumentId = (string)r["reportDocumentId"];
+        var status = (string)r["processingStatus"];
+
+        if (string.IsNullOrWhiteSpace(reportId) || string.IsNullOrWhiteSpace(reportDocumentId)) continue;
+        if (!string.Equals(status, "DONE", StringComparison.OrdinalIgnoreCase)) continue;
+        if (IsAlreadyProcessed(reportId)) continue;
+
+        var docResp = await SpApiGet("/reports/2021-06-30/documents/" + reportDocumentId, "", lwaToken);
+        var docTxt = await docResp.Content.ReadAsStringAsync();
+        if (!docResp.IsSuccessStatusCode)
+            return new JObject { ["id"]=-501, ["Message"]="SP-API get document error", ["detail"]=docTxt };
+
+        var docJson = JObject.Parse(docTxt);
+        var url = (string)docJson["url"];
+
+        if (string.IsNullOrWhiteSpace(url))
+            return new JObject { ["id"]=-502, ["Message"]="Document URL empty", ["detail"]=docTxt };
+
+        if (docJson["encryptionDetails"] != null && docJson["encryptionDetails"].Type != JTokenType.Null)
+        {
+            return new JObject {
+                ["id"] = -503,
+                ["Message"] = "SP-API returned encryptionDetails. Need decryption support. Send me one sample documents/{id} response and I’ll add it.",
+                ["detail"] = docTxt
+            };
+        }
+
+        var bytes = await DownloadBytes(url);
+        var tsv = Encoding.UTF8.GetString(bytes);
+
+        int ins = InsertStageLines(reportId, tsv);
+
+        processed++;
+        stagedLines += ins;
+    }
+
+    return new JObject {
+        ["ok"] = 1,
+        ["reportsProcessed"] = processed,
+        ["linesStaged"] = stagedLines,
+        ["createdSince"] = SafeCreatedSince(createdSince)
+    };
+}
+catch (Exception ex)
+{
+    return new JObject { ["id"]=-900, ["Message"]=ex.Message, ["stack"]=ex.ToString() };
+}
+
+
+{ 
+  "engine": "Worker", 
+  "lwa_client_id": "PUT_LWA_CLIENT_ID",
+  "lwa_client_secret": "PUT_LWA_CLIENT_SECRET",
+  "lwa_refresh_token": "PUT_LWA_REFRESH_TOKEN",
+  "aws_access_key": "PUT_AWS_ACCESS_KEY",
+  "aws_secret_key": "PUT_AWS_SECRET_KEY",
+  "aws_session_token": "",
+  "region": "us-east-1",
+  "spapi_host": "sellingpartnerapi-na.amazon.com",
+  "report_type": "GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2",
+  "created_since": "",
+  "max_reports": 20
+}

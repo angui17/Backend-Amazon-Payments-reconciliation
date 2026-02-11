@@ -1,0 +1,137 @@
+using System;
+using System.Data.Odbc;
+using Newtonsoft.Json.Linq;
+using System.Collections.Generic;
+
+string resultJson = "";
+
+string GetStr(string key)
+{
+    if (InputJson == null) return null;
+
+    var jo = InputJson as JObject;
+    if (jo != null)
+    {
+        JToken t;
+        if (!jo.TryGetValue(key, out t) || t == null || t.Type == JTokenType.Null) return null;
+        var s = t.ToString();
+        if (string.Equals(s, "null", StringComparison.OrdinalIgnoreCase)) return null;
+        return s;
+    }
+
+    var dict = InputJson as IDictionary<string, object>;
+    if (dict != null)
+    {
+        if (!dict.ContainsKey(key)) return null;
+        var val = dict[key];
+        if (val == null || val is DBNull) return null;
+        var s = Convert.ToString(val);
+        if (string.IsNullOrWhiteSpace(s) || string.Equals(s, "null", StringComparison.OrdinalIgnoreCase)) return null;
+        return s;
+    }
+
+    return null;
+}
+
+int? GetInt(string key)
+{
+    if (InputJson == null) return null;
+
+    var jo = InputJson as JObject;
+    if (jo != null)
+    {
+        JToken t;
+        if (!jo.TryGetValue(key, out t) || t == null || t.Type == JTokenType.Null) return null;
+        try { return t.ToObject<int?>(); } catch { return null; }
+    }
+
+    var dict = InputJson as IDictionary<string, object>;
+    if (dict != null)
+    {
+        if (!dict.ContainsKey(key)) return null;
+        var val = dict[key];
+        if (val == null || val is DBNull) return null;
+        try { return Convert.ToInt32(val); } catch { return null; }
+    }
+
+    return null;
+}
+
+string fecha_desde     = GetStr("fecha_desde");
+string fecha_hasta     = GetStr("fecha_hasta");
+string status          = GetStr("status");
+string settlementId    = GetStr("settlementId");
+string accountLike     = GetStr("account_like");
+int? limitAccounts     = GetInt("limit_accounts");
+
+if (string.IsNullOrWhiteSpace(fecha_desde)) fecha_desde = "01-01-2000";
+if (string.IsNullOrWhiteSpace(fecha_hasta)) fecha_hasta = DateTime.Now.ToString("MM-dd-yyyy");
+
+if (string.IsNullOrWhiteSpace(status)) status = "ALL";
+status = status.Trim().ToUpper();
+
+settlementId = (settlementId ?? "").Trim();
+accountLike  = (accountLike ?? "").Trim();
+
+int limit_accounts = (limitAccounts.HasValue && limitAccounts.Value > 0) ? limitAccounts.Value : 200;
+
+using (var connection = new OdbcConnection("{ConnectionString}"))
+{
+    connection.Open();
+
+    using (var command = new OdbcCommand("{ CALL \"CTS_ACCOUNTING_GL_SUMMARY\"( ?, ?, ?, ?, ?, ? ) }", connection))
+    {
+        command.Parameters.Add("fecha_desde", OdbcType.VarChar).Value = fecha_desde;
+        command.Parameters.Add("fecha_hasta", OdbcType.VarChar).Value = fecha_hasta;
+        command.Parameters.Add("p_status", OdbcType.VarChar).Value = status;
+
+        if (string.IsNullOrWhiteSpace(settlementId))
+            command.Parameters.Add("p_settlement_id", OdbcType.VarChar).Value = DBNull.Value;
+        else
+            command.Parameters.Add("p_settlement_id", OdbcType.VarChar).Value = settlementId;
+
+        if (string.IsNullOrWhiteSpace(accountLike))
+            command.Parameters.Add("p_account_like", OdbcType.VarChar).Value = DBNull.Value;
+        else
+            command.Parameters.Add("p_account_like", OdbcType.VarChar).Value = accountLike;
+
+        command.Parameters.Add("limit_accounts", OdbcType.Int).Value = limit_accounts;
+
+        using (var reader = command.ExecuteReader())
+        {
+            if (reader.Read() && !reader.IsDBNull(0))
+                resultJson = reader.GetString(0);
+        }
+    }
+}
+
+if (string.IsNullOrWhiteSpace(resultJson))
+{
+    return new JObject
+    {
+        ["id"] = -500,
+        ["Message"] = "SP no devolvió datos (JSONRESULT NULL/empty)."
+    };
+}
+
+try { return JObject.Parse(resultJson); }
+catch
+{
+    return new JObject
+    {
+        ["id"] = -501,
+        ["Message"] = "SP devolvió un JSON inválido."
+    };
+}
+
+
+
+{ 
+  "engine": "Worker", 
+  "fecha_desde": "01-01-2025",
+  "fecha_hasta": "12-31-2025",
+  "status": "ALL",
+  "settlementId": "",
+  "account_like": "",
+  "limit_accounts": 200
+}

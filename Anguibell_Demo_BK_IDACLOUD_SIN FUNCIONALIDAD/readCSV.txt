@@ -1,0 +1,338 @@
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using System.Data.SqlClient;
+using System.Text;
+using System.Data;
+
+    public class CsvProcessingFunction
+    {
+        private readonly ILogger<CsvProcessingFunction> _logger;
+        private readonly BlobServiceClient _blobServiceClient;
+        private readonly string _sqlConnectionString;
+
+        public CsvProcessingFunction(ILogger<CsvProcessingFunction> logger)
+        {
+            _logger = logger;
+            
+            var storageConnectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+            _sqlConnectionString = Environment.GetEnvironmentVariable("SqlConnectionString");
+            
+            _blobServiceClient = new BlobServiceClient(storageConnectionString);
+        }
+
+        [Function("CsvFileProcessor")]
+        public async Task Run(
+            [BlobTrigger("pending-csv/{name}")] BlobClient blobClient,
+            string name,
+            FunctionContext context)
+        {
+            _logger.LogInformation($"Processing CSV file: {name}");
+
+            try
+            {
+                // Descargar el archivo CSV
+                var blobContent = await DownloadBlobContent(blobClient);
+                
+                // Procesar el contenido CSV (igual que tu código original)
+                await ProcessCsvFile(blobContent, name);
+                
+                // Mover archivo a contenedor de procesados
+                await MoveToProcessedContainer(blobClient, name);
+                
+                _logger.LogInformation($"Successfully processed CSV file: {name}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error processing CSV file: {name}");
+                await MoveToFailedContainer(blobClient, name);
+                throw;
+            }
+        }
+
+        private async Task<string> DownloadBlobContent(BlobClient blobClient)
+        {
+            try
+            {
+                BlobDownloadResult downloadResult = await blobClient.DownloadContentAsync();
+                return downloadResult.Content.ToString();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error downloading blob content");
+                throw;
+            }
+        }
+
+        private async Task ProcessCsvFile(string csvContent, string fileName)
+        {
+            // Replicar exactamente el procesamiento de tu código original
+            int flag = 0;
+            string readContents = "";
+
+            using (var streamReader = new StringReader(csvContent))
+            {
+                string line;
+                while ((line = await streamReader.ReadLineAsync()) != null)
+                {
+                    if (line.Contains("date/time"))
+                    {
+                        flag = 1;
+                    }
+
+                    if (flag == 1)
+                    {
+                        if (string.IsNullOrEmpty(readContents))
+                        {
+                            readContents = line.Replace("\",\"", "\"|\"").Replace("'", "");
+                        }
+                        else
+                        {
+                            readContents = readContents + "
+" + line.Replace("\",\"", "\"|\"").Replace("'", "");
+                        }
+                    }
+                }
+            }
+
+            // Procesar el contenido como DataTable (igual que tu código)
+            DataTable dt = ReadCsvToDataTableFromString(readContents);
+
+            for (int k = 0; k < dt.Rows.Count; k++)
+            {
+                string DATE_TIME = dt.Rows[k][0].ToString();
+                string SETTLEMENT_ID = dt.Rows[k][1].ToString();
+                string TYPE = dt.Rows[k][2].ToString();
+                string ORDER_ID = dt.Rows[k][3].ToString();
+                string SKU = dt.Rows[k][4].ToString();
+                string DESCRIPTION = dt.Rows[k][5].ToString();
+
+                if (dt.Rows[k][6].ToString() == "")
+                {
+                    dt.Rows[k][6] = "0";
+                }
+                
+                double QUANTITY = Convert.ToDouble(dt.Rows[k][6].ToString());
+                string MARKETPLACE = dt.Rows[k][7].ToString();
+                string ACCOUNT_TYPE = dt.Rows[k][8].ToString();
+                string FULFILLMENT = dt.Rows[k][9].ToString();
+                string ORDER_CITY = dt.Rows[k][10].ToString();
+                string ORDER_STATE = dt.Rows[k][11].ToString();
+                string ORDER_POSTAL = dt.Rows[k][12].ToString();
+                string TAX_COLLECTION_MODEL = dt.Rows[k][13].ToString();
+
+                double PRODUCT_SALES = Convert.ToDouble(dt.Rows[k][14].ToString());
+                double PRODUCT_SALES_TAX = Convert.ToDouble(dt.Rows[k][15].ToString());
+                double SHIPPING_CREDITS = Convert.ToDouble(dt.Rows[k][16].ToString());
+                double SHIPPING_CREDITS_TAX = Convert.ToDouble(dt.Rows[k][17].ToString());
+                double GIFT_WRAP_CREDITS = Convert.ToDouble(dt.Rows[k][18].ToString());
+                double GIFTWRAP_CREDITS_TAX = Convert.ToDouble(dt.Rows[k][19].ToString());
+                double REGULATORY_FEE = Convert.ToDouble(dt.Rows[k][20].ToString());
+                double TAX_ON_REGULATORY_FEE = Convert.ToDouble(dt.Rows[k][21].ToString());
+                double PROMOTIONAL_REBATES = Convert.ToDouble(dt.Rows[k][22].ToString());
+                double PROMOTIONAL_REBATES_TAX = Convert.ToDouble(dt.Rows[k][23].ToString());
+                double MARKETPLACE_WITHHELD_TAX = Convert.ToDouble(dt.Rows[k][24].ToString());
+                double SELLING_FEES = Convert.ToDouble(dt.Rows[k][25].ToString());
+                double FBA_FEES = Convert.ToDouble(dt.Rows[k][26].ToString());
+                double OTHER_TRANSACTION_FEES = Convert.ToDouble(dt.Rows[k][27].ToString());
+                double OTHER = Convert.ToDouble(dt.Rows[k][28].ToString());
+                double TOTAL = Convert.ToDouble(dt.Rows[k][29].ToString());
+
+                // Usar la misma consulta SQL de tu código original
+                string query = @"
+                    INSERT INTO CTS_AMAZON_SALES (
+                        ID_UNIQUE, DATE_TIME, SETTLEMENT_ID, TYPE, ORDER_ID, SKU, DESCRIPTION, QUANTITY,
+                        MARKETPLACE, ACCOUNT_TYPE, FULFILLMENT, ORDER_CITY, ORDER_STATE, ORDER_POSTAL,
+                        TAX_COLLECTION_MODEL, PRODUCT_SALES, PRODUCT_SALES_TAX, SHIPPING_CREDITS,
+                        SHIPPING_CREDITS_TAX, GIFT_WRAP_CREDITS, GIFTWRAP_CREDITS_TAX, REGULATORY_FEE,
+                        TAX_ON_REGULATORY_FEE, PROMOTIONAL_REBATES, PROMOTIONAL_REBATES_TAX,
+                        MARKETPLACE_WITHHELD_TAX, SELLING_FEES, FBA_FEES, OTHER_TRANSACTION_FEES, OTHER, TOTAL)
+                    VALUES (
+                        unique_id_seq.NEXTVAL, @DATE_TIME, @SETTLEMENT_ID, @TYPE, @ORDER_ID, @SKU, @DESCRIPTION, @QUANTITY,
+                        @MARKETPLACE, @ACCOUNT_TYPE, @FULFILLMENT, @ORDER_CITY, @ORDER_STATE, @ORDER_POSTAL,
+                        @TAX_COLLECTION_MODEL, @PRODUCT_SALES, @PRODUCT_SALES_TAX, @SHIPPING_CREDITS,
+                        @SHIPPING_CREDITS_TAX, @GIFT_WRAP_CREDITS, @GIFTWRAP_CREDITS_TAX, @REGULATORY_FEE,
+                        @TAX_ON_REGULATORY_FEE, @PROMOTIONAL_REBATES, @PROMOTIONAL_REBATES_TAX,
+                        @MARKETPLACE_WITHHELD_TAX, @SELLING_FEES, @FBA_FEES, @OTHER_TRANSACTION_FEES, @OTHER, @TOTAL)";
+
+                await ExecuteSalesInsert(query, new
+                {
+                    DATE_TIME, SETTLEMENT_ID, TYPE, ORDER_ID, SKU, DESCRIPTION, QUANTITY,
+                    MARKETPLACE, ACCOUNT_TYPE, FULFILLMENT, ORDER_CITY, ORDER_STATE, ORDER_POSTAL,
+                    TAX_COLLECTION_MODEL, PRODUCT_SALES, PRODUCT_SALES_TAX, SHIPPING_CREDITS,
+                    SHIPPING_CREDITS_TAX, GIFT_WRAP_CREDITS, GIFTWRAP_CREDITS_TAX, REGULATORY_FEE,
+                    TAX_ON_REGULATORY_FEE, PROMOTIONAL_REBATES, PROMOTIONAL_REBATES_TAX,
+                    MARKETPLACE_WITHHELD_TAX, SELLING_FEES, FBA_FEES, OTHER_TRANSACTION_FEES, OTHER, TOTAL
+                });
+            }
+        }
+
+        private DataTable ReadCsvToDataTableFromString(string csvContent)
+        {
+            DataTable dt = new DataTable();
+            using (StringReader sr = new StringReader(csvContent))
+            {
+                string[] headers = sr.ReadLine().Split('|');
+                foreach (string header in headers)
+                {
+                    dt.Columns.Add(header.Replace("\"","").Replace("/", "_").Replace(" ", "_").ToUpper());
+                }
+
+                while (sr.Peek() != -1)
+                {
+                    string line = sr.ReadLine();
+                    if (!string.IsNullOrEmpty(line))
+                    {
+                        string[] rows = line.Split('|');
+                        DataRow dr = dt.NewRow();
+                        for (int i = 0; i < headers.Length && i < rows.Length; i++)
+                        {
+                            dr[i] = rows[i].Replace("\"", "").ToUpper();
+                        }
+                        dt.Rows.Add(dr);
+                    }
+                }
+            }
+            return dt;
+        }
+
+        private async Task ExecuteSalesInsert(string query, dynamic parameters)
+        {
+            using var connection = new SqlConnection(_sqlConnectionString);
+            await connection.OpenAsync();
+
+            using var command = new SqlCommand(query, connection);
+            
+            // Agregar parámetros
+            command.Parameters.AddWithValue("@DATE_TIME", parameters.DATE_TIME);
+            command.Parameters.AddWithValue("@SETTLEMENT_ID", parameters.SETTLEMENT_ID);
+            command.Parameters.AddWithValue("@TYPE", parameters.TYPE);
+            command.Parameters.AddWithValue("@ORDER_ID", parameters.ORDER_ID);
+            command.Parameters.AddWithValue("@SKU", parameters.SKU);
+            command.Parameters.AddWithValue("@DESCRIPTION", parameters.DESCRIPTION);
+            command.Parameters.AddWithValue("@QUANTITY", parameters.QUANTITY);
+            command.Parameters.AddWithValue("@MARKETPLACE", parameters.MARKETPLACE);
+            command.Parameters.AddWithValue("@ACCOUNT_TYPE", parameters.ACCOUNT_TYPE);
+            command.Parameters.AddWithValue("@FULFILLMENT", parameters.FULFILLMENT);
+            command.Parameters.AddWithValue("@ORDER_CITY", parameters.ORDER_CITY);
+            command.Parameters.AddWithValue("@ORDER_STATE", parameters.ORDER_STATE);
+            command.Parameters.AddWithValue("@ORDER_POSTAL", parameters.ORDER_POSTAL);
+            command.Parameters.AddWithValue("@TAX_COLLECTION_MODEL", parameters.TAX_COLLECTION_MODEL);
+            command.Parameters.AddWithValue("@PRODUCT_SALES", parameters.PRODUCT_SALES);
+            command.Parameters.AddWithValue("@PRODUCT_SALES_TAX", parameters.PRODUCT_SALES_TAX);
+            command.Parameters.AddWithValue("@SHIPPING_CREDITS", parameters.SHIPPING_CREDITS);
+            command.Parameters.AddWithValue("@SHIPPING_CREDITS_TAX", parameters.SHIPPING_CREDITS_TAX);
+            command.Parameters.AddWithValue("@GIFT_WRAP_CREDITS", parameters.GIFT_WRAP_CREDITS);
+            command.Parameters.AddWithValue("@GIFTWRAP_CREDITS_TAX", parameters.GIFTWRAP_CREDITS_TAX);
+            command.Parameters.AddWithValue("@REGULATORY_FEE", parameters.REGULATORY_FEE);
+            command.Parameters.AddWithValue("@TAX_ON_REGULATORY_FEE", parameters.TAX_ON_REGULATORY_FEE);
+            command.Parameters.AddWithValue("@PROMOTIONAL_REBATES", parameters.PROMOTIONAL_REBATES);
+            command.Parameters.AddWithValue("@PROMOTIONAL_REBATES_TAX", parameters.PROMOTIONAL_REBATES_TAX);
+            command.Parameters.AddWithValue("@MARKETPLACE_WITHHELD_TAX", parameters.MARKETPLACE_WITHHELD_TAX);
+            command.Parameters.AddWithValue("@SELLING_FEES", parameters.SELLING_FEES);
+            command.Parameters.AddWithValue("@FBA_FEES", parameters.FBA_FEES);
+            command.Parameters.AddWithValue("@OTHER_TRANSACTION_FEES", parameters.OTHER_TRANSACTION_FEES);
+            command.Parameters.AddWithValue("@OTHER", parameters.OTHER);
+            command.Parameters.AddWithValue("@TOTAL", parameters.TOTAL);
+
+            await command.ExecuteNonQueryAsync();
+        }
+
+        private async Task MoveToProcessedContainer(BlobClient originalBlob, string fileName)
+        {
+            var processedContainer = _blobServiceClient.GetBlobContainerClient("processed-csv");
+            await processedContainer.CreateIfNotExistsAsync();
+
+            var processedBlob = processedContainer.GetBlobClient(fileName);
+            await processedBlob.StartCopyFromUriAsync(originalBlob.Uri);
+            await originalBlob.DeleteIfExistsAsync();
+        }
+
+        private async Task MoveToFailedContainer(BlobClient originalBlob, string fileName)
+        {
+            var failedContainer = _blobServiceClient.GetBlobContainerClient("failed-csv");
+            await failedContainer.CreateIfNotExistsAsync();
+
+            var failedBlob = failedContainer.GetBlobClient(fileName);
+            await failedBlob.StartCopyFromUriAsync(originalBlob.Uri);
+            await originalBlob.DeleteIfExistsAsync();
+        }
+    }
+
+    // API Controller para monitoreo (mantener igual)
+    [ApiController]
+    [Route("api/[controller]")]
+    public class FileProcessingController : ControllerBase
+    {
+        private readonly ILogger<FileProcessingController> _logger;
+        private readonly BlobServiceClient _blobServiceClient;
+
+        public FileProcessingController(ILogger<FileProcessingController> logger)
+        {
+            _logger = logger;
+            var storageConnectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+            _blobServiceClient = new BlobServiceClient(storageConnectionString);
+        }
+
+        [HttpGet("status")]
+        public async Task<IActionResult> GetProcessingStatus()
+        {
+            var status = new
+            {
+                PendingFiles = await GetContainerFileCount("pending-csv"),
+                ProcessedFiles = await GetContainerFileCount("processed-csv"),
+                FailedFiles = await GetContainerFileCount("failed-csv"),
+                LastProcessed = DateTime.UtcNow.AddHours(-1)
+            };
+
+            return Ok(status);
+        }
+
+        [HttpGet("status/{fileName}")]
+        public async Task<IActionResult> GetFileStatus(string fileName)
+        {
+            var containers = new[] { "pending-csv", "processed-csv", "failed-csv" };
+
+            foreach (var containerName in containers)
+            {
+                var container = _blobServiceClient.GetBlobContainerClient(containerName);
+                if (await container.ExistsAsync())
+                {
+                    var blob = container.GetBlobClient(fileName);
+                    if (await blob.ExistsAsync())
+                    {
+                        var properties = await blob.GetPropertiesAsync();
+                        return Ok(new
+                        {
+                            FileName = fileName,
+                            Status = containerName.Replace("-csv", "").ToUpper(),
+                            LastModified = properties.Value.LastModified,
+                            Size = properties.Value.ContentLength
+                        });
+                    }
+                }
+            }
+
+            return NotFound($"File {fileName} not found in any container");
+        }
+
+        private async Task<int> GetContainerFileCount(string containerName)
+        {
+            var container = _blobServiceClient.GetBlobContainerClient(containerName);
+            if (!await container.ExistsAsync())
+                return 0;
+
+            var count = 0;
+            await foreach (var blobItem in container.GetBlobsAsync())
+            {
+                count++;
+            }
+            return count;
+        }
+    }
+
+{ 
+  "engine": "Worker", 
+  "name": "World"
+}

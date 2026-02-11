@@ -1,0 +1,117 @@
+using System;
+using System.Data.Odbc;
+using Newtonsoft.Json.Linq;
+
+string resultJson = "";
+
+// REQUIRED: type must be provided (depends on frontend page)
+string type = InputJson["type"]?.ToString();
+
+// Optional dates and last
+string fecha_desde = InputJson["fecha_desde"]?.ToString();
+string fecha_hasta = InputJson["fecha_hasta"]?.ToString();
+int? lastRecords = InputJson["last"]?.ToObject<int?>();
+int limitRecords = lastRecords.HasValue ? lastRecords.Value : 10; // default only for limit
+
+// Validate 'type'
+if (string.IsNullOrWhiteSpace(type))
+{
+    return new JObject
+    {
+        ["id"] = -400,
+        ["Message"] = "Parameter 'type' is required. Example: { \"type\": \"Order\", \"last\": 10 }"
+    };
+}
+
+// 🔥 Normalización para evitar errores por espacios o mayúsculas
+type = type.Trim();
+type = type.Trim().ToUpper();
+
+// Default dates only if both missing
+if (string.IsNullOrEmpty(fecha_desde) && string.IsNullOrEmpty(fecha_hasta))
+{
+    fecha_desde = "01-01-2000";
+    fecha_hasta = DateTime.Now.ToString("MM-dd-yyyy");
+}
+
+// If last requested, keep your behavior: wide range
+if (lastRecords.HasValue && lastRecords.Value > 0)
+{
+    fecha_desde = "01-01-2000";
+    fecha_hasta = DateTime.Now.ToString("MM-dd-yyyy");
+}
+
+using (var connection = new OdbcConnection("{ConnectionString}"))
+{
+    connection.Open();
+
+    using (var command = new OdbcCommand("{ CALL \"CTS_AMAZON_INPAYMENTS_RECONCILIATIONS\"( ?, ?, ?, ? ) }", connection))
+    {
+        // SP signature order: (p_type, fecha_desde, fecha_hasta, limit_records)
+        command.Parameters.Add("p_type", OdbcType.VarChar).Value = type;
+        command.Parameters.Add("fecha_desde", OdbcType.VarChar).Value = fecha_desde;
+        command.Parameters.Add("fecha_hasta", OdbcType.VarChar).Value = fecha_hasta;
+        command.Parameters.Add("limit_records", OdbcType.Int).Value = limitRecords;
+
+        using (var reader = command.ExecuteReader())
+        {
+            if (reader.Read())
+            {
+                resultJson = reader.GetString(0);
+            }
+        }
+    }
+}
+
+if (string.IsNullOrWhiteSpace(resultJson))
+{
+    return new JObject
+    {
+        ["id"] = -500,
+        ["Message"] = "SP no devolvió datos."
+    };
+}
+
+JArray rows;
+try
+{
+    rows = JArray.Parse(resultJson);
+}
+catch
+{
+    return new JObject
+    {
+        ["id"] = -501,
+        ["Message"] = "SP devolvió un JSON inválido."
+    };
+}
+
+// Return rows directly (same style as your current service)
+return rows;
+
+/*
+// OPTIONAL WRAP (enable if you want summary+rows later)
+return new JObject
+{
+    ["meta"] = new JObject
+    {
+        ["generatedAt"] = DateTime.UtcNow.ToString("o"),
+        ["requestId"] = Guid.NewGuid().ToString()
+    },
+    ["filters"] = new JObject
+    {
+        ["type"] = type,
+        ["fecha_desde"] = fecha_desde,
+        ["fecha_hasta"] = fecha_hasta,
+        ["limit_records"] = limitRecords
+    },
+    ["rows"] = rows
+};
+*/
+
+
+{
+  "engine": "Worker",
+  "type": "Order",
+  "last": 10
+}

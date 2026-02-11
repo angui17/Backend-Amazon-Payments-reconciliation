@@ -1,0 +1,72 @@
+using System;
+using System.Data.Odbc;
+using Newtonsoft.Json.Linq;
+
+string resultJson = "";
+
+// Inputs
+string settlementId = InputJson["settlementId"]?.ToString();
+int? limitRows = InputJson["limit_rows"]?.ToObject<int?>();
+
+// Validate
+if (string.IsNullOrWhiteSpace(settlementId))
+{
+    return new JObject
+    {
+        ["id"] = -400,
+        ["Message"] = "Parameter 'settlementId' is required. Example: { \"settlementId\": \"23405515541\", \"limit_rows\": 1000 }"
+    };
+}
+
+settlementId = settlementId.Trim();
+int limit = (limitRows.HasValue && limitRows.Value > 0) ? limitRows.Value : 1000;
+
+using (var connection = new OdbcConnection("{ConnectionString}"))
+{
+    connection.Open();
+
+    using (var command = new OdbcCommand("{ CALL \"CTS_ACCOUNTING_JOURNAL_LINES\"( ?, ? ) }", connection))
+    {
+        command.Parameters.Add("p_settlement_id", OdbcType.VarChar).Value = settlementId;
+        command.Parameters.Add("limit_rows", OdbcType.Int).Value = limit;
+
+        using (var reader = command.ExecuteReader())
+        {
+            if (reader.Read())
+            {
+                resultJson = reader.GetString(0);
+            }
+        }
+    }
+}
+
+// Validate response
+if (string.IsNullOrWhiteSpace(resultJson))
+{
+    return new JObject
+    {
+        ["id"] = -500,
+        ["Message"] = "SP no devolvió datos."
+    };
+}
+
+// Return parsed JSON object
+try
+{
+    return JObject.Parse(resultJson);
+}
+catch
+{
+    return new JObject
+    {
+        ["id"] = -501,
+        ["Message"] = "SP devolvió un JSON inválido."
+    };
+}
+
+
+{
+  "engine": "Worker",
+  "settlementId": "23405515541",
+  "limit_rows": 1000
+}

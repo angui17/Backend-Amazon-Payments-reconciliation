@@ -1,0 +1,142 @@
+using System;
+using System.Data.Odbc;
+using Newtonsoft.Json.Linq;
+
+// -------------------------
+// Input
+// -------------------------
+string resultJson = "";
+
+// REQUIRED: type must be provided by frontend page (Orders, Refunds, Fees, etc.)
+string type = InputJson["type"]?.ToString();
+
+string fecha_desde = InputJson["fecha_desde"]?.ToString();
+string fecha_hasta = InputJson["fecha_hasta"]?.ToString();
+
+int? lastRecords = InputJson["last"]?.ToObject<int?>();
+int limitRecords = lastRecords.HasValue ? lastRecords.Value : 10; // keep default for limit only
+
+// -------------------------
+// Validate 'type' (NO DEFAULT)
+// -------------------------
+if (string.IsNullOrWhiteSpace(type))
+{
+    return new JObject
+    {
+        ["id"] = -400,
+        ["Message"] = "Parameter 'type' is required. Example: { \"type\": \"ORDER\", \"last\": 10 }"
+    };
+}
+
+// Normalize type (optional): trim whitespace
+type = type.Trim();
+
+// -------------------------
+// Default dates (only if both missing)
+// -------------------------
+if (string.IsNullOrEmpty(fecha_desde) && string.IsNullOrEmpty(fecha_hasta))
+{
+    // Keep your current behavior
+    fecha_desde = "01-01-2000";
+    fecha_hasta = DateTime.Now.ToString("MM-dd-yyyy");
+}
+
+// If lastRecords requested, force the wide range logic you already use
+if (lastRecords.HasValue && lastRecords.Value > 0)
+{
+    fecha_desde = "01-01-2000";
+    fecha_hasta = DateTime.Now.ToString("MM-dd-yyyy");
+}
+
+// -------------------------
+// Call SP
+// -------------------------
+using (var connection = new OdbcConnection("{ConnectionString}"))
+{
+    connection.Open();
+
+    // New generic SP with TYPE param
+    using (var command = new OdbcCommand("{ CALL \"CTS_AMAZON_SALES_RECONCILIATIONS\"( ?, ?, ?, ? ) }", connection))
+    {
+        // IMPORTANT: order must match SP signature:
+        // (p_type, fecha_desde, fecha_hasta, limit_records)
+        command.Parameters.Add("p_type", OdbcType.VarChar).Value = type;
+        command.Parameters.Add("fecha_desde", OdbcType.VarChar).Value = fecha_desde;
+        command.Parameters.Add("fecha_hasta", OdbcType.VarChar).Value = fecha_hasta;
+        command.Parameters.Add("limit_records", OdbcType.Int).Value = limitRecords;
+
+        using (var reader = command.ExecuteReader())
+        {
+            if (reader.Read())
+            {
+                // SP returns JSON string in column 0 (FOR JSON)
+                resultJson = reader.GetString(0);
+            }
+        }
+    }
+}
+
+// -------------------------
+// Validate SP response
+// -------------------------
+if (string.IsNullOrWhiteSpace(resultJson))
+{
+    return new JObject
+    {
+        ["id"] = -500,
+        ["Message"] = "SP no devolvió datos."
+    };
+}
+
+// -------------------------
+// Return
+// Option A (current behavior): return rows array directly
+// -------------------------
+JArray rows;
+try
+{
+    rows = JArray.Parse(resultJson);
+}
+catch
+{
+    return new JObject
+    {
+        ["id"] = -501,
+        ["Message"] = "SP devolvió un JSON inválido."
+    };
+}
+
+return rows;
+
+// -------------------------
+// Option B (recommended): wrap as { meta, filters, rows }
+// If you prefer this, comment out 'return rows;' above and uncomment below.
+// -------------------------
+/*
+var response = new JObject
+{
+    ["meta"] = new JObject
+    {
+        ["generatedAt"] = DateTime.UtcNow.ToString("o"),
+        ["requestId"] = Guid.NewGuid().ToString()
+    },
+    ["filters"] = new JObject
+    {
+        ["type"] = type,
+        ["fecha_desde"] = fecha_desde,
+        ["fecha_hasta"] = fecha_hasta,
+        ["limit_records"] = limitRecords
+    },
+    ["rows"] = rows
+};
+
+return response;
+*/
+{
+  "engine": "Worker",
+  "type": "ORDER",
+  "fecha_desde": "10-01-2024",
+  "fecha_hasta": "10-31-2024"
+}
+
+

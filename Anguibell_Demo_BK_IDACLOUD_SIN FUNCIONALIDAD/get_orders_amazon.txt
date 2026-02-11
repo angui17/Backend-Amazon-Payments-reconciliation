@@ -1,0 +1,63 @@
+using System;
+using System.Data.Odbc;
+using Newtonsoft.Json.Linq;
+using System.Text;
+using System.Linq;
+
+string resultJson = "";
+string fecha_desde = InputJson["fecha_desde"]?.ToString();
+string fecha_hasta = InputJson["fecha_hasta"]?.ToString();
+int? lastRecords = InputJson["last"]?.ToObject<int?>();
+int limitRecords = lastRecords.HasValue ? lastRecords.Value : 10;  // Default a 10 si no se especifica
+
+if (string.IsNullOrEmpty(fecha_desde) && string.IsNullOrEmpty(fecha_hasta))
+{
+    fecha_desde = "01-01-2000";
+    fecha_hasta = DateTime.Now.ToString("MM-dd-yyyy");
+}
+
+using (var connection = new OdbcConnection("{ConnectionString}"))
+{
+    connection.Open();
+
+    // Si se solicita las últimas N órdenes, usar un rango de fechas amplio
+    if (lastRecords.HasValue && lastRecords.Value > 0)
+    {
+        // Usar fechas que abarquen todo el historial disponible
+        fecha_desde = "01-01-2000";
+        fecha_hasta = DateTime.Now.ToString("MM-dd-yyyy");
+    }
+
+    using (var command = new OdbcCommand("{ CALL \"CTS_ORDERS_RECONCILIATIONS\"( ?, ?, ? ) }", connection))
+{
+    command.Parameters.Add("fecha_desde", OdbcType.VarChar).Value = fecha_desde;
+    command.Parameters.Add("fecha_hasta", OdbcType.VarChar).Value = fecha_hasta;
+    command.Parameters.Add("limit_records", OdbcType.Int).Value = limitRecords; 
+
+        using (var reader = command.ExecuteReader())
+        {
+            if (reader.Read())
+            {
+                resultJson = reader.GetString(0);
+            }
+        }
+    }
+}
+
+// Validar respuesta
+if (string.IsNullOrWhiteSpace(resultJson))
+{
+    return new JObject
+    {
+        ["id"] = -500,
+        ["Message"] = "SP no devolvió datos."
+    };
+}
+
+
+return JArray.Parse(resultJson);
+
+
+{ 
+  "engine": "Worker"
+}

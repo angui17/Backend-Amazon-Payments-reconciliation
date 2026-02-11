@@ -1,0 +1,331 @@
+using System;
+using System.IO;
+using System.Data.SqlClient;
+using System.Data;
+using System.Text;
+using Newtonsoft.Json.Linq;
+
+// WebService para procesar archivos CSV de Amazon Sales
+public static JObject Run(JObject InputJson)
+{
+    try
+    {
+        // Obtener parámetros de configuración desde InputJson
+        string pendingFolder = InputJson["pendingFolder"]?.ToString() ?? @"C:\SAP\Binaries\AmazonSales\Pending\";
+        string processedFolder = InputJson["processedFolder"]?.ToString() ?? @"C:\SAP\Binaries\AmazonSales\Processed\";
+        string failedFolder = InputJson["failedFolder"]?.ToString() ?? @"C:\SAP\Binaries\AmazonSales\Failed\";
+        string sqlConnectionString = InputJson["sqlConnectionString"]?.ToString();
+
+        // Validar conexión a base de datos
+        if (string.IsNullOrEmpty(sqlConnectionString))
+        {
+            return new JObject
+            {
+                ["id"] = -400,
+                ["Error"] = "Database connection string is required"
+            };
+        }
+
+        // Crear directorios si no existen
+        Directory.CreateDirectory(pendingFolder);
+        Directory.CreateDirectory(processedFolder);
+        Directory.CreateDirectory(failedFolder);
+
+        // Obtener todos los archivos CSV pendientes
+        var csvFiles = Directory.GetFiles(pendingFolder, "*.csv");
+
+        if (csvFiles.Length == 0)
+        {
+            return new JObject
+            {
+                ["id"] = 100,
+                ["Message"] = "No CSV files found to process",
+                ["FilesProcessed"] = 0
+            };
+        }
+
+        int totalFilesProcessed = 0;
+        int totalRowsInserted = 0;
+        var processingResults = new JArray();
+
+        // Procesar cada archivo CSV
+        foreach (var filePath in csvFiles)
+        {
+            var fileName = Path.GetFileName(filePath);
+            var fileResult = new JObject
+            {
+                ["fileName"] = fileName,
+                ["status"] = "pending"
+            };
+
+            try
+            {
+                // Leer contenido del archivo
+                string csvContent = File.ReadAllText(filePath);
+                
+                // Procesar el archivo CSV
+                int rowsProcessed = ProcessCsvFile(csvContent, fileName, sqlConnectionString);
+                
+                // Mover archivo a procesados
+                string processedPath = Path.Combine(processedFolder, fileName);
+                File.Move(filePath, processedPath, true);
+
+                fileResult["status"] = "success";
+                fileResult["rowsProcessed"] = rowsProcessed;
+                totalRowsInserted += rowsProcessed;
+                totalFilesProcessed++;
+            }
+            catch (Exception ex)
+            {
+                // Mover archivo a fallidos en caso de error
+                string failedPath = Path.Combine(failedFolder, fileName);
+                File.Move(filePath, failedPath, true);
+
+                fileResult["status"] = "failed";
+                fileResult["error"] = ex.Message;
+            }
+
+            processingResults.Add(fileResult);
+        }
+
+        // Retornar resultado del procesamiento
+        return new JObject
+        {
+            ["id"] = 100,
+            ["Message"] = "CSV processing completed",
+            ["TotalFilesProcessed"] = totalFilesProcessed,
+            ["TotalRowsInserted"] = totalRowsInserted,
+            ["ProcessingResults"] = processingResults,
+            ["engine"] = InputJson["engine"]?.ToString(),
+            ["name"] = InputJson["name"]?.ToString()
+        };
+    }
+    catch (Exception ex)
+    {
+        return new JObject
+        {
+            ["id"] = -500,
+            ["Error"] = $"Unexpected error: {ex.Message}"
+        };
+    }
+}
+
+// Procesa el contenido del archivo CSV y lo inserta en la base de datos
+private static int ProcessCsvFile(string csvContent, string fileName, string sqlConnectionString)
+{
+    int flag = 0;
+    string readContents = "";
+    int rowsProcessed = 0;
+
+    using (var streamReader = new StringReader(csvContent))
+    {
+        string line;
+        while ((line = streamReader.ReadLine()) != null)
+        {
+            // Buscar la línea que contiene "date/time" para empezar a procesar datos
+            if (line.Contains("date/time"))
+            {
+                flag = 1;
+            }
+
+            // Una vez encontrado el header, procesar las líneas
+            if (flag == 1)
+            {
+                if (string.IsNullOrEmpty(readContents))
+                {
+                    // Reemplazar separadores y caracteres problemáticos
+                    readContents = line.Replace("\",\"", "\"|\"").Replace("'", "");
+                }
+                else
+                {
+                    readContents = readContents + "
+" + line.Replace("\",\"", "\"|\"").Replace("'", "");
+                }
+            }
+        }
+    }
+
+    // Convertir el contenido procesado a DataTable
+    DataTable dt = ReadCsvToDataTableFromString(readContents);
+
+    // Procesar cada fila del DataTable
+    for (int k = 0; k < dt.Rows.Count; k++)
+    {
+        // Validar que sea una fila de datos (no headers vacíos)
+        if (string.IsNullOrEmpty(dt.Rows[k][0]?.ToString()) || dt.Rows[k][0].ToString().Contains("date/time"))
+            continue;
+
+        // Extraer y limpiar datos de cada columna
+        string DATE_TIME = dt.Rows[k][0].ToString();
+        string SETTLEMENT_ID = dt.Rows[k][1].ToString();
+        string TYPE = dt.Rows[k][2].ToString();
+        string ORDER_ID = dt.Rows[k][3].ToString();
+        string SKU = dt.Rows[k][4].ToString();
+        string DESCRIPTION = dt.Rows[k][5].ToString();
+
+        // Manejar valores vacíos en cantidad
+        if (dt.Rows[k][6].ToString() == "")
+        {
+            dt.Rows[k][6] = "0";
+        }
+        
+        double QUANTITY = Convert.ToDouble(dt.Rows[k][6].ToString());
+        string MARKETPLACE = dt.Rows[k][7].ToString();
+        string ACCOUNT_TYPE = dt.Rows[k][8].ToString();
+        string FULFILLMENT = dt.Rows[k][9].ToString();
+        string ORDER_CITY = dt.Rows[k][10].ToString();
+        string ORDER_STATE = dt.Rows[k][11].ToString();
+        string ORDER_POSTAL = dt.Rows[k][12].ToString();
+        string TAX_COLLECTION_MODEL = dt.Rows[k][13].ToString();
+
+        // Convertir valores numéricos con manejo de errores
+        double PRODUCT_SALES = SafeConvertToDouble(dt.Rows[k][14].ToString());
+        double PRODUCT_SALES_TAX = SafeConvertToDouble(dt.Rows[k][15].ToString());
+        double SHIPPING_CREDITS = SafeConvertToDouble(dt.Rows[k][16].ToString());
+        double SHIPPING_CREDITS_TAX = SafeConvertToDouble(dt.Rows[k][17].ToString());
+        double GIFT_WRAP_CREDITS = SafeConvertToDouble(dt.Rows[k][18].ToString());
+        double GIFTWRAP_CREDITS_TAX = SafeConvertToDouble(dt.Rows[k][19].ToString());
+        double REGULATORY_FEE = SafeConvertToDouble(dt.Rows[k][20].ToString());
+        double TAX_ON_REGULATORY_FEE = SafeConvertToDouble(dt.Rows[k][21].ToString());
+        double PROMOTIONAL_REBATES = SafeConvertToDouble(dt.Rows[k][22].ToString());
+        double PROMOTIONAL_REBATES_TAX = SafeConvertToDouble(dt.Rows[k][23].ToString());
+        double MARKETPLACE_WITHHELD_TAX = SafeConvertToDouble(dt.Rows[k][24].ToString());
+        double SELLING_FEES = SafeConvertToDouble(dt.Rows[k][25].ToString());
+        double FBA_FEES = SafeConvertToDouble(dt.Rows[k][26].ToString());
+        double OTHER_TRANSACTION_FEES = SafeConvertToDouble(dt.Rows[k][27].ToString());
+        double OTHER = SafeConvertToDouble(dt.Rows[k][28].ToString());
+        double TOTAL = SafeConvertToDouble(dt.Rows[k][29].ToString());
+
+        // Consulta SQL para insertar datos
+        string query = @"
+            INSERT INTO CTS_AMAZON_SALES (
+                DATE_TIME, SETTLEMENT_ID, TYPE, ORDER_ID, SKU, DESCRIPTION, QUANTITY,
+                MARKETPLACE, ACCOUNT_TYPE, FULFILLMENT, ORDER_CITY, ORDER_STATE, ORDER_POSTAL,
+                TAX_COLLECTION_MODEL, PRODUCT_SALES, PRODUCT_SALES_TAX, SHIPPING_CREDITS,
+                SHIPPING_CREDITS_TAX, GIFT_WRAP_CREDITS, GIFTWRAP_CREDITS_TAX, REGULATORY_FEE,
+                TAX_ON_REGULATORY_FEE, PROMOTIONAL_REBATES, PROMOTIONAL_REBATES_TAX,
+                MARKETPLACE_WITHHELD_TAX, SELLING_FEES, FBA_FEES, OTHER_TRANSACTION_FEES, OTHER, TOTAL)
+            VALUES (
+                @DATE_TIME, @SETTLEMENT_ID, @TYPE, @ORDER_ID, @SKU, @DESCRIPTION, @QUANTITY,
+                @MARKETPLACE, @ACCOUNT_TYPE, @FULFILLMENT, @ORDER_CITY, @ORDER_STATE, @ORDER_POSTAL,
+                @TAX_COLLECTION_MODEL, @PRODUCT_SALES, @PRODUCT_SALES_TAX, @SHIPPING_CREDITS,
+                @SHIPPING_CREDITS_TAX, @GIFT_WRAP_CREDITS, @GIFTWRAP_CREDITS_TAX, @REGULATORY_FEE,
+                @TAX_ON_REGULATORY_FEE, @PROMOTIONAL_REBATES, @PROMOTIONAL_REBATES_TAX,
+                @MARKETPLACE_WITHHELD_TAX, @SELLING_FEES, @FBA_FEES, @OTHER_TRANSACTION_FEES, @OTHER, @TOTAL)";
+
+        // Ejecutar la inserción en la base de datos
+        ExecuteSalesInsert(query, new
+        {
+            DATE_TIME, SETTLEMENT_ID, TYPE, ORDER_ID, SKU, DESCRIPTION, QUANTITY,
+            MARKETPLACE, ACCOUNT_TYPE, FULFILLMENT, ORDER_CITY, ORDER_STATE, ORDER_POSTAL,
+            TAX_COLLECTION_MODEL, PRODUCT_SALES, PRODUCT_SALES_TAX, SHIPPING_CREDITS,
+            SHIPPING_CREDITS_TAX, GIFT_WRAP_CREDITS, GIFTWRAP_CREDITS_TAX, REGULATORY_FEE,
+            TAX_ON_REGULATORY_FEE, PROMOTIONAL_REBATES, PROMOTIONAL_REBATES_TAX,
+            MARKETPLACE_WITHHELD_TAX, SELLING_FEES, FBA_FEES, OTHER_TRANSACTION_FEES, OTHER, TOTAL
+        }, sqlConnectionString);
+
+        rowsProcessed++;
+    }
+
+    return rowsProcessed;
+}
+
+// Convierte el string CSV en un DataTable
+private static DataTable ReadCsvToDataTableFromString(string csvContent)
+{
+    DataTable dt = new DataTable();
+    using (StringReader sr = new StringReader(csvContent))
+    {
+        // Leer headers y limpiar nombres de columnas
+        string[] headers = sr.ReadLine().Split('|');
+        foreach (string header in headers)
+        {
+            dt.Columns.Add(header.Replace("\"","").Replace("/", "_").Replace(" ", "_").ToUpper());
+        }
+
+        // Leer y procesar cada línea de datos
+        while (sr.Peek() != -1)
+        {
+            string line = sr.ReadLine();
+            if (!string.IsNullOrEmpty(line))
+            {
+                string[] rows = line.Split('|');
+                DataRow dr = dt.NewRow();
+                for (int i = 0; i < headers.Length && i < rows.Length; i++)
+                {
+                    dr[i] = rows[i].Replace("\"", "").ToUpper();
+                }
+                dt.Rows.Add(dr);
+            }
+        }
+    }
+    return dt;
+}
+
+// Ejecuta la inserción en la base de datos
+private static void ExecuteSalesInsert(string query, dynamic parameters, string sqlConnectionString)
+{
+    using var connection = new SqlConnection(sqlConnectionString);
+    connection.Open();
+
+    using var command = new SqlCommand(query, connection);
+    
+    // Agregar todos los parámetros a la consulta
+    command.Parameters.AddWithValue("@DATE_TIME", parameters.DATE_TIME);
+    command.Parameters.AddWithValue("@SETTLEMENT_ID", parameters.SETTLEMENT_ID);
+    command.Parameters.AddWithValue("@TYPE", parameters.TYPE);
+    command.Parameters.AddWithValue("@ORDER_ID", parameters.ORDER_ID);
+    command.Parameters.AddWithValue("@SKU", parameters.SKU);
+    command.Parameters.AddWithValue("@DESCRIPTION", parameters.DESCRIPTION);
+    command.Parameters.AddWithValue("@QUANTITY", parameters.QUANTITY);
+    command.Parameters.AddWithValue("@MARKETPLACE", parameters.MARKETPLACE);
+    command.Parameters.AddWithValue("@ACCOUNT_TYPE", parameters.ACCOUNT_TYPE);
+    command.Parameters.AddWithValue("@FULFILLMENT", parameters.FULFILLMENT);
+    command.Parameters.AddWithValue("@ORDER_CITY", parameters.ORDER_CITY);
+    command.Parameters.AddWithValue("@ORDER_STATE", parameters.ORDER_STATE);
+    command.Parameters.AddWithValue("@ORDER_POSTAL", parameters.ORDER_POSTAL);
+    command.Parameters.AddWithValue("@TAX_COLLECTION_MODEL", parameters.TAX_COLLECTION_MODEL);
+    command.Parameters.AddWithValue("@PRODUCT_SALES", parameters.PRODUCT_SALES);
+    command.Parameters.AddWithValue("@PRODUCT_SALES_TAX", parameters.PRODUCT_SALES_TAX);
+    command.Parameters.AddWithValue("@SHIPPING_CREDITS", parameters.SHIPPING_CREDITS);
+    command.Parameters.AddWithValue("@SHIPPING_CREDITS_TAX", parameters.SHIPPING_CREDITS_TAX);
+    command.Parameters.AddWithValue("@GIFT_WRAP_CREDITS", parameters.GIFT_WRAP_CREDITS);
+    command.Parameters.AddWithValue("@GIFTWRAP_CREDITS_TAX", parameters.GIFTWRAP_CREDITS_TAX);
+    command.Parameters.AddWithValue("@REGULATORY_FEE", parameters.REGULATORY_FEE);
+    command.Parameters.AddWithValue("@TAX_ON_REGULATORY_FEE", parameters.TAX_ON_REGULATORY_FEE);
+    command.Parameters.AddWithValue("@PROMOTIONAL_REBATES", parameters.PROMOTIONAL_REBATES);
+    command.Parameters.AddWithValue("@PROMOTIONAL_REBATES_TAX", parameters.PROMOTIONAL_REBATES_TAX);
+    command.Parameters.AddWithValue("@MARKETPLACE_WITHHELD_TAX", parameters.MARKETPLACE_WITHHELD_TAX);
+    command.Parameters.AddWithValue("@SELLING_FEES", parameters.SELLING_FEES);
+    command.Parameters.AddWithValue("@FBA_FEES", parameters.FBA_FEES);
+    command.Parameters.AddWithValue("@OTHER_TRANSACTION_FEES", parameters.OTHER_TRANSACTION_FEES);
+    command.Parameters.AddWithValue("@OTHER", parameters.OTHER);
+    command.Parameters.AddWithValue("@TOTAL", parameters.TOTAL);
+
+    command.ExecuteNonQuery();
+}
+
+// Conversión segura a double para manejar errores
+private static double SafeConvertToDouble(string value)
+{
+    if (string.IsNullOrEmpty(value) || value.Trim() == "")
+        return 0.0;
+    
+    try
+    {
+        return Convert.ToDouble(value);
+    }
+    catch
+    {
+        return 0.0;
+    }
+}
+
+{
+  "engine": "nombre_engine",
+  "name": "nombre_servicio", 
+  "pendingFolder": "C:\SAP\Binaries\AmazonSales\Pending\",
+  "processedFolder": "C:\SAP\Binaries\AmazonSales\Processed\",
+  "failedFolder": "C:\SAP\Binaries\AmazonSales\Failed\",
+  "sqlConnectionString": "Server=servidor;Database=basedatos;User Id=usuario;Password=contraseña;"
+}

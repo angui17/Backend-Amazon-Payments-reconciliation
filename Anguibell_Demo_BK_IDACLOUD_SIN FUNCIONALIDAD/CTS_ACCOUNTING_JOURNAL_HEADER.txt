@@ -1,0 +1,84 @@
+using System;
+using System.Data.Odbc;
+using Newtonsoft.Json.Linq;
+
+string resultJson = "";
+
+// Inputs
+string fecha_desde = InputJson["fecha_desde"]?.ToString();
+string fecha_hasta = InputJson["fecha_hasta"]?.ToString();
+string status = InputJson["status"]?.ToString();         // 'P','C','ALL'
+int? limitRecords = InputJson["limit_records"]?.ToObject<int?>();
+
+// Defaults
+if (string.IsNullOrWhiteSpace(status)) status = "ALL";
+int limit = (limitRecords.HasValue && limitRecords.Value > 0) ? limitRecords.Value : 100;
+
+// If dates missing, keep same convention
+if (string.IsNullOrEmpty(fecha_desde) && string.IsNullOrEmpty(fecha_hasta))
+{
+    fecha_desde = "01-01-2000";
+    fecha_hasta = DateTime.Now.ToString("MM-dd-yyyy");
+}
+else
+{
+    if (string.IsNullOrWhiteSpace(fecha_desde)) fecha_desde = "01-01-2000";
+    if (string.IsNullOrWhiteSpace(fecha_hasta)) fecha_hasta = DateTime.Now.ToString("MM-dd-yyyy");
+}
+
+using (var connection = new OdbcConnection("{ConnectionString}"))
+{
+    connection.Open();
+
+    using (var command = new OdbcCommand("{ CALL \"CTS_ACCOUNTING_JOURNAL_HEADER\"( ?, ?, ?, ? ) }", connection))
+    {
+        command.Parameters.Add("fecha_desde", OdbcType.VarChar).Value = fecha_desde;
+        command.Parameters.Add("fecha_hasta", OdbcType.VarChar).Value = fecha_hasta;
+
+        // normalize like we do in other services
+        command.Parameters.Add("p_status", OdbcType.VarChar).Value = (status ?? "ALL").Trim().ToUpper();
+
+        command.Parameters.Add("limit_records", OdbcType.Int).Value = limit;
+
+        using (var reader = command.ExecuteReader())
+        {
+            if (reader.Read())
+            {
+                resultJson = reader.GetString(0);
+            }
+        }
+    }
+}
+
+// Validate response
+if (string.IsNullOrWhiteSpace(resultJson))
+{
+    return new JObject
+    {
+        ["id"] = -500,
+        ["Message"] = "SP no devolvió datos."
+    };
+}
+
+// Return parsed JSON object
+try
+{
+    return JObject.Parse(resultJson);
+}
+catch
+{
+    return new JObject
+    {
+        ["id"] = -501,
+        ["Message"] = "SP devolvió un JSON inválido."
+    };
+}
+
+
+{
+  "engine": "Worker",
+  "fecha_desde": "01-01-2000",
+  "fecha_hasta": "01-01-2000",
+  "status": "ALL",
+  "limit_records": 100
+}

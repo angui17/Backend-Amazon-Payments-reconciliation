@@ -1,0 +1,153 @@
+using System;
+using System.Data.Odbc;
+using Newtonsoft.Json.Linq;
+using SAPbobsCOM;
+using System.Collections.Generic;
+
+int GetInt(string k, int def)
+{
+    if (InputJson == null) return def;
+    var t = InputJson[k];
+    if (t == null || t.Type == JTokenType.Null) return def;
+    int v; return int.TryParse(t.ToString(), out v) ? v : def;
+}
+
+int maxHeaders = GetInt("max_headers", 50);
+
+var C = new SAPbobsCOM.Company();
+// IMPORTANT: prefer configuring these in the IDA environment/worker, not in code.
+// If your environment already injects a ready SAP connection, tell me and we simplify.
+C.Server = "COPAHANA:30015";
+C.LicenseServer = "COPAHANA:40000";
+C.CompanyDB = "SBO_COPA_LIVE";
+C.UserName = "manager";
+C.Password = "SAP2018";
+C.DbUserName = "SYSTEM";
+C.DbPassword = "SAPB1Admin";
+C.language = SAPbobsCOM.BoSuppLangs.ln_English;
+C.DbServerType = SAPbobsCOM.BoDataServerTypes.dst_HANADB;
+
+int ret = C.Connect();
+if (ret != 0)
+{
+    return new JObject {
+        ["id"] = -500,
+        ["Message"] = "Error connecting to SAP B1 (DI API): " + C.GetLastErrorDescription()
+    };
+}
+
+int created = 0;
+int skipped = 0;
+int errors = 0;
+
+try
+{
+    Recordset R = (Recordset)C.GetBusinessObject(BoObjectTypes.BoRecordset);
+    Recordset R2 = (Recordset)C.GetBusinessObject(BoObjectTypes.BoRecordset);
+    Recordset R3 = (Recordset)C.GetBusinessObject(BoObjectTypes.BoRecordset);
+
+    R.DoQuery("CALL CTS_AMAZON_HEADER_PAYMENT()");
+    if (R.RecordCount == 0)
+    {
+        return new JObject { ["ok"]=1, ["created"]=0, ["skipped"]=0, ["Message"]="No payments to process." };
+    }
+
+    int processedHeaders = 0;
+    while (!R.EoF && processedHeaders < maxHeaders)
+    {
+        string headerId = Convert.ToString(R.Fields.Item("id").Value);
+
+        R3.DoQuery($"CALL CTS_AMAZON_VALIDATE_PAYMENT('{headerId.Replace("'", "''")}')");
+        bool exists = Convert.ToBoolean(R3.Fields.Item(0).Value);
+
+        if (exists)
+        {
+            skipped++;
+            R.MoveNext();
+            processedHeaders++;
+            continue;
+        }
+
+        Payments payment = (Payments)C.GetBusinessObject(BoObjectTypes.oPaymentsDrafts);
+        payment.DocObjectCode = BoPaymentsObjectType.bopot_IncomingPayments;
+
+        payment.CardCode = Convert.ToString(R.Fields.Item("CardCode").Value);
+        payment.DocDate = (DateTime)R.Fields.Item("deposit-date").Value;
+        payment.DueDate = (DateTime)R.Fields.Item("deposit-date").Value;
+        payment.TaxDate = (DateTime)R.Fields.Item("deposit-date").Value;
+        payment.JournalRemarks = Convert.ToString(R.Fields.Item("JournalRemarks").Value);
+
+        payment.UserFields.Fields.Item("U_CTS_Source").Value = "AMAZON";
+        payment.TransferAccount = "1107";
+        payment.TransferSum = Convert.ToDouble(R.Fields.Item("total-amount").Value);
+        payment.TransferDate = (DateTime)R.Fields.Item("deposit-date").Value;
+        payment.TransferReference = headerId;
+        payment.UserFields.Fields.Item("U_CTS_SettlementID").Value = headerId;
+        payment.UserFields.Fields.Item("U_CTS_TotalRef").Value = R.Fields.Item("total-amount").Value;
+
+        R2.DoQuery($"CALL CTS_AMAZON_DETAIL_PAYMENT('{headerId.Replace("'", "''")}')");
+        if (R2.RecordCount == 0)
+        {
+            // no detail, skip
+            skipped++;
+            R.MoveNext();
+            processedHeaders++;
+            continue;
+        }
+
+        while (!R2.EoF)
+        {
+            payment.Invoices.DocEntry = R2.Fields.Item("DocEntry").Value;
+            string docType = Convert.ToString(R2.Fields.Item("DocumentType").Value);
+            payment.Invoices.SumApplied = Convert.ToDouble(R2.Fields.Item("amount").Value);
+
+            if (docType == "30")
+            {
+                payment.Invoices.DocLine = R2.Fields.Item("Line_ID").Value;
+                payment.Invoices.SumApplied = Convert.ToDouble(R2.Fields.Item("amount").Value);
+                payment.Invoices.InvoiceType = BoRcptInvTypes.it_JournalEntry;
+            }
+            else if (docType == "13")
+                payment.Invoices.InvoiceType = BoRcptInvTypes.it_Invoice;
+            else if (docType == "14")
+                payment.Invoices.InvoiceType = BoRcptInvTypes.it_CredItnote;
+
+            payment.Invoices.Add();
+            R2.MoveNext();
+        }
+
+        int addRes = payment.Add();
+        if (addRes != 0)
+        {
+            errors++;
+        }
+        else
+        {
+            created++;
+        }
+
+        R.MoveNext();
+        processedHeaders++;
+    }
+
+    return new JObject {
+        ["ok"] = 1,
+        ["created"] = created,
+        ["skipped"] = skipped,
+        ["errors"] = errors,
+        ["max_headers"] = maxHeaders
+    };
+}
+catch (Exception ex)
+{
+    return new JObject { ["id"]=-900, ["Message"]=ex.Message, ["stack"]=ex.ToString() };
+}
+finally
+{
+    try { C.Disconnect(); } catch {}
+}
+
+{ 
+  "engine": "Worker", 
+  "max_headers": 50
+}

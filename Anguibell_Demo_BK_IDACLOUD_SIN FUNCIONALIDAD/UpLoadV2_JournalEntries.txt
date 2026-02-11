@@ -1,0 +1,759 @@
+using System;
+using System.Net;
+using System.Net.Http;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.WebJobs;
+using Microsoft.Azure.WebJobs.Extensions.Http;
+using Microsoft.Azure.WebJobs.Extensions.SignalRService;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
+using SAPbobsCOM;
+using System.Data;
+using System.Collections.Generic;
+using Polly;
+using System.Threading;
+using System.Linq;
+using System.Text;
+
+public static class UpLoadV2_JournalEntries
+{
+    private static readonly AsyncRetryPolicy _retryPolicy = Policy
+        .Handle<Exception>()
+        .WaitAndRetryAsync(
+            retryCount: 3,
+            sleepDurationProvider: retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
+            onRetry: (exception, timeSpan, retryCount, context) =>
+            {
+                var logger = (ILogger)context["logger"];
+                logger.LogWarning($"Retry {retryCount} for SAP journal entry after {timeSpan} due to: {exception.Message}");
+            });
+
+    [FunctionName("CreateJournalEntries")]
+    public static async Task<IActionResult> CreateJournalEntries(
+        [HttpTrigger(AuthorizationLevel.Function, "post", Route = "journalentries/create")] HttpRequest req,
+        [SignalR(HubName = "journalNotifications")] IAsyncCollector<SignalRMessage> signalRMessages,
+        ILogger log)
+    {
+        log.LogInformation("C# HTTP trigger function processed a request for journal entries creation.");
+
+        string connectionId = req.Headers["X-SignalR-ConnectionId"];
+        string batchId = Guid.NewGuid().ToString();
+
+        try
+        {
+            // Parse request body
+            string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+            var journalRequest = JsonConvert.DeserializeObject<JournalEntriesRequest>(requestBody);
+
+            // Send initial status update
+            await SendRealTimeUpdate(signalRMessages, connectionId, "PROCESSING", 
+                "Starting journal entries processing", batchId, journalRequest.SettlementIDs?.FirstOrDefault());
+
+            // Validate financial data against business rules
+            var validationResult = await ValidateJournalEntries(journalRequest, log);
+            if (!validationResult.IsValid)
+            {
+                await SendRealTimeUpdate(signalRMessages, connectionId, "VALIDATION_FAILED", 
+                    string.Join("; ", validationResult.Errors), batchId, journalRequest.SettlementIDs?.FirstOrDefault());
+                
+                return new BadRequestObjectResult(new { 
+                    error = "Financial validation failed", 
+                    details = validationResult.Errors,
+                    batchId = batchId
+                });
+            }
+
+            await SendRealTimeUpdate(signalRMessages, connectionId, "VALIDATING", 
+                "Financial validation successful", batchId, journalRequest.SettlementIDs?.FirstOrDefault());
+
+            // Process in batches if needed
+            var batchResults = new List<BatchProcessingResult>();
+            
+            if (journalRequest.ProcessInBatches && journalRequest.JournalEntries.Count > 10)
+            {
+                await SendRealTimeUpdate(signalRMessages, connectionId, "BATCH_PROCESSING", 
+                    $"Processing {journalRequest.JournalEntries.Count} entries in batches", batchId, journalRequest.SettlementIDs?.FirstOrDefault());
+                
+                batchResults = await ProcessJournalEntriesInBatches(journalRequest, log, signalRMessages, connectionId, batchId);
+            }
+            else
+            {
+                await SendRealTimeUpdate(signalRMessages, connectionId, "SINGLE_BATCH", 
+                    $"Processing {journalRequest.JournalEntries.Count} entries in single batch", batchId, journalRequest.SettlementIDs?.FirstOrDefault());
+                
+                var singleBatchResult = await ProcessJournalEntriesBatch(journalRequest.JournalEntries, journalRequest, log, signalRMessages, connectionId, batchId);
+                batchResults.Add(singleBatchResult);
+            }
+
+            // Compile final results
+            var finalResult = CompileBatchResults(batchResults, batchId);
+
+            // Send final notification
+            await SendRealTimeUpdate(signalRMessages, connectionId, 
+                finalResult.Success ? "COMPLETED" : "PARTIALLY_COMPLETED", 
+                finalResult.Message, batchId, journalRequest.SettlementIDs?.FirstOrDefault());
+
+            if (finalResult.Success)
+            {
+                return new OkObjectResult(new { 
+                    message = finalResult.Message,
+                    batchId = batchId,
+                    totalEntries = finalResult.TotalEntries,
+                    successfulEntries = finalResult.SuccessfulEntries,
+                    failedEntries = finalResult.FailedEntries,
+                    documentEntries = finalResult.DocumentEntries,
+                    timestamp = DateTime.UtcNow
+                });
+            }
+            else
+            {
+                return new ObjectResult(new { 
+                    error = finalResult.Message,
+                    batchId = batchId,
+                    totalEntries = finalResult.TotalEntries,
+                    successfulEntries = finalResult.SuccessfulEntries,
+                    failedEntries = finalResult.FailedEntries,
+                    details = finalResult.FailedDetails
+                })
+                {
+                    StatusCode = finalResult.SuccessfulEntries > 0 ? 207 : 500 // 207 Multi-Status if partial success
+                };
+            }
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Unhandled exception in CreateJournalEntries: {ex.Message}");
+            await SendRealTimeUpdate(signalRMessages, connectionId, "ERROR", 
+                $"Unhandled exception: {ex.Message}", batchId, null);
+            
+            return new ObjectResult(new { 
+                error = "Internal server error", 
+                details = ex.Message,
+                batchId = batchId
+            })
+            {
+                StatusCode = 500
+            };
+        }
+    }
+
+    [FunctionName("GetJournalEntryStatus")]
+    public static async Task<IActionResult> GetJournalEntryStatus(
+        [HttpTrigger(AuthorizationLevel.Function, "get", Route = "journalentries/status/{batchId}")] HttpRequest req,
+        string batchId,
+        ILogger log)
+    {
+        try
+        {
+            var status = await GetJournalEntryStatusFromDatabase(batchId, log);
+            
+            return new OkObjectResult(new {
+                batchId = batchId,
+                status = status.Status,
+                totalEntries = status.TotalEntries,
+                successfulEntries = status.SuccessfulEntries,
+                failedEntries = status.FailedEntries,
+                documentEntries = status.DocumentEntries,
+                lastUpdated = status.LastUpdated,
+                errorMessages = status.ErrorMessages
+            });
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Error getting journal entry status: {ex.Message}");
+            return new ObjectResult(new { error = "Error retrieving journal entry status" })
+            {
+                StatusCode = 500
+            };
+        }
+    }
+
+    [FunctionName("ValidateJournalEntries")]
+    public static async Task<IActionResult> ValidateJournalEntries(
+        [HttpTrigger(AuthorizationLevel.Function, "post", Route = "journalentries/validate")] HttpRequest req,
+        ILogger log)
+    {
+        try
+        {
+            string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+            var journalRequest = JsonConvert.DeserializeObject<JournalEntriesRequest>(requestBody);
+
+            var validationResult = await ValidateJournalEntries(journalRequest, log);
+
+            return new OkObjectResult(new {
+                isValid = validationResult.IsValid,
+                errors = validationResult.Errors,
+                warnings = validationResult.Warnings,
+                validationTimestamp = DateTime.UtcNow
+            });
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Error validating journal entries: {ex.Message}");
+            return new ObjectResult(new { error = "Error during validation" })
+            {
+                StatusCode = 500
+            };
+        }
+    }
+
+    [FunctionName("negotiate")]
+    public static SignalRConnectionInfo Negotiate(
+        [HttpTrigger(AuthorizationLevel.Anonymous)] HttpRequest req,
+        [SignalRConnectionInfo(HubName = "journalNotifications")] SignalRConnectionInfo connectionInfo)
+    {
+        return connectionInfo;
+    }
+
+    private static async Task<FinancialValidationResult> ValidateJournalEntries(JournalEntriesRequest journalRequest, ILogger log)
+    {
+        var errors = new List<string>();
+        var warnings = new List<string>();
+
+        try
+        {
+            // Basic validation
+            if (journalRequest.JournalEntries == null || !journalRequest.JournalEntries.Any())
+            {
+                errors.Add("At least one journal entry is required");
+                return new FinancialValidationResult { IsValid = false, Errors = errors, Warnings = warnings };
+            }
+
+            // Validate entry date
+            if (journalRequest.EntryDate == DateTime.MinValue)
+            {
+                errors.Add("Valid EntryDate is required");
+            }
+
+            // Validate each journal entry
+            double totalDebit = 0;
+            double totalCredit = 0;
+            int entryIndex = 0;
+
+            foreach (var entry in journalRequest.JournalEntries)
+            {
+                entryIndex++;
+
+                // Validate account codes
+                if (string.IsNullOrEmpty(entry.AccountCode))
+                {
+                    errors.Add($"Journal entry {entryIndex}: AccountCode is required");
+                }
+                else
+                {
+                    // Validate account code format and existence (placeholder)
+                    var accountValidation = await ValidateAccountCode(entry.AccountCode, log);
+                    if (!accountValidation.IsValid)
+                    {
+                        errors.Add($"Journal entry {entryIndex}: Invalid account code {entry.AccountCode} - {accountValidation.Message}");
+                    }
+                }
+
+                // Validate amounts
+                if (entry.Debit < 0 || entry.Credit < 0)
+                {
+                    errors.Add($"Journal entry {entryIndex}: Debit and Credit amounts must be non-negative");
+                }
+
+                if (entry.Debit > 0 && entry.Credit > 0)
+                {
+                    errors.Add($"Journal entry {entryIndex}: Cannot have both Debit and Credit amounts");
+                }
+
+                if (entry.Debit == 0 && entry.Credit == 0)
+                {
+                    warnings.Add($"Journal entry {entryIndex}: Both Debit and Credit are zero - this entry will be skipped");
+                }
+
+                // Validate settlement ID
+                if (string.IsNullOrEmpty(entry.SettlementID))
+                {
+                    warnings.Add($"Journal entry {entryIndex}: SettlementID is missing");
+                }
+
+                // Sum for balance check
+                totalDebit += entry.Debit;
+                totalCredit += entry.Credit;
+            }
+
+            // Validate accounting equation: Debits = Credits
+            if (Math.Abs(totalDebit - totalCredit) > 0.01) // Allow small rounding differences
+            {
+                errors.Add($"Accounting equation not balanced: Total Debit ({totalDebit}) ≠ Total Credit ({totalCredit})");
+            }
+
+            // Business rule validation: Maximum single entry amount
+            var maxAmount = journalRequest.JournalEntries.Max(e => Math.Max(e.Debit, e.Credit));
+            if (maxAmount > 1000000) // Example business rule: $1,000,000 limit
+            {
+                warnings.Add($"Large amount detected: {maxAmount}. Please verify this transaction.");
+            }
+
+            await Task.Delay(50); // Simulate async validation
+
+            return new FinancialValidationResult 
+            { 
+                IsValid = !errors.Any(), 
+                Errors = errors, 
+                Warnings = warnings 
+            };
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Journal entry validation error: {ex.Message}");
+            return new FinancialValidationResult 
+            { 
+                IsValid = false, 
+                Errors = new List<string> { $"Validation error: {ex.Message}" } 
+            };
+        }
+    }
+
+    private static async Task<List<BatchProcessingResult>> ProcessJournalEntriesInBatches(
+        JournalEntriesRequest journalRequest, ILogger log, 
+        IAsyncCollector<SignalRMessage> signalRMessages, string connectionId, string batchId)
+    {
+        var batchResults = new List<BatchProcessingResult>();
+        int batchSize = journalRequest.BatchSize > 0 ? journalRequest.BatchSize : 50;
+        var batches = SplitIntoBatches(journalRequest.JournalEntries, batchSize);
+
+        await SendRealTimeUpdate(signalRMessages, connectionId, "BATCH_START", 
+            $"Processing {batches.Count} batches", batchId, journalRequest.SettlementIDs?.FirstOrDefault());
+
+        for (int i = 0; i < batches.Count; i++)
+        {
+            var batch = batches[i];
+            await SendRealTimeUpdate(signalRMessages, connectionId, "BATCH_PROCESSING", 
+                $"Processing batch {i + 1} of {batches.Count} ({batch.Count} entries)", batchId, journalRequest.SettlementIDs?.FirstOrDefault());
+
+            var batchResult = await ProcessJournalEntriesBatch(batch, journalRequest, log, signalRMessages, connectionId, batchId);
+            batchResults.Add(batchResult);
+
+            // Small delay between batches to avoid overwhelming SAP
+            if (i < batches.Count - 1)
+            {
+                await Task.Delay(1000);
+            }
+        }
+
+        return batchResults;
+    }
+
+    private static async Task<BatchProcessingResult> ProcessJournalEntriesBatch(
+        List<JournalEntry> entries, JournalEntriesRequest journalRequest, ILogger log,
+        IAsyncCollector<SignalRMessage> signalRMessages, string connectionId, string batchId)
+    {
+        var batchResult = new BatchProcessingResult();
+        var validEntries = entries.Where(e => e.Debit != 0 || e.Credit != 0).ToList();
+        batchResult.TotalEntries = validEntries.Count;
+
+        if (!validEntries.Any())
+        {
+            batchResult.Message = "No valid entries to process (all entries have zero amounts)";
+            return batchResult;
+        }
+
+        try
+        {
+            await SendRealTimeUpdate(signalRMessages, connectionId, "CREATING_JOURNAL", 
+                $"Creating journal entry with {validEntries.Count} lines", batchId, journalRequest.SettlementIDs?.FirstOrDefault());
+
+            var context = new Context
+            {
+                { "logger", log },
+                { "operation", "CreateJournalEntry" },
+                { "signalRMessages", signalRMessages },
+                { "connectionId", connectionId },
+                { "batchId", batchId }
+            };
+
+            var result = await _retryPolicy.ExecuteAsync(async (ctx) =>
+            {
+                return await CreateJournalEntryInSAP(validEntries, journalRequest, log, signalRMessages, connectionId, batchId);
+            }, context);
+
+            if (result.Success)
+            {
+                batchResult.SuccessfulEntries = validEntries.Count;
+                batchResult.DocumentEntries.Add(result.DocumentEntry);
+                batchResult.Message = $"Successfully created journal entry {result.DocumentEntry}";
+                
+                // Update database status for processed settlement IDs
+                await UpdateSettlementStatus(validEntries, result.DocumentEntry, log);
+            }
+            else
+            {
+                batchResult.FailedEntries = validEntries.Count;
+                batchResult.FailedDetails.Add($"Batch failed: {result.ErrorMessage}");
+                batchResult.Message = $"Failed to create journal entry: {result.ErrorMessage}";
+            }
+        }
+        catch (Exception ex)
+        {
+            batchResult.FailedEntries = validEntries.Count;
+            batchResult.FailedDetails.Add($"Batch exception: {ex.Message}");
+            batchResult.Message = $"Exception creating journal entry: {ex.Message}";
+            log.LogError($"Exception processing journal entry batch: {ex.Message}");
+        }
+
+        return batchResult;
+    }
+
+    private static async Task<SAPOperationResult> CreateJournalEntryInSAP(
+        List<JournalEntry> entries, JournalEntriesRequest journalRequest, ILogger log,
+        IAsyncCollector<SignalRMessage> signalRMessages, string connectionId, string batchId)
+    {
+        Company company = null;
+        
+        try
+        {
+            await SendRealTimeUpdate(signalRMessages, connectionId, "CONNECTING_SAP", 
+                "Connecting to SAP Business One", batchId, journalRequest.SettlementIDs?.FirstOrDefault());
+
+            // Initialize SAP connection
+            company = await SAPConnectionService.ConnectToSAP(log);
+            if (company == null || !company.Connected)
+            {
+                return new SAPOperationResult { Success = false, ErrorMessage = "Failed to connect to SAP" };
+            }
+
+            await SendRealTimeUpdate(signalRMessages, connectionId, "CREATING_DOCUMENT", 
+                "Creating journal entry document", batchId, journalRequest.SettlementIDs?.FirstOrDefault());
+
+            // Create journal entry
+            JournalEntries journalEntry = (JournalEntries)company.GetBusinessObject(BoObjectTypes.oJournalEntries);
+            
+            // Configure journal entry header
+            journalEntry.ReferenceDate = journalRequest.EntryDate;
+            journalEntry.DueDate = journalRequest.EntryDate;
+            journalEntry.TaxDate = journalRequest.EntryDate;
+            journalEntry.Memo = $"Amazon adjustments - {journalRequest.EntryDate:MM/yyyy}";
+            
+            if (!string.IsNullOrEmpty(journalRequest.Comments))
+            {
+                journalEntry.Memo = journalRequest.Comments;
+            }
+
+            await SendRealTimeUpdate(signalRMessages, connectionId, "ADDING_LINES", 
+                $"Adding {entries.Count} journal lines", batchId, journalRequest.SettlementIDs?.FirstOrDefault());
+
+            // Track processed settlement IDs for this journal entry
+            var processedSettlementIDs = new HashSet<string>();
+
+            // Add journal entry lines with compensation entries
+            foreach (var entry in entries)
+            {
+                if (!string.IsNullOrEmpty(entry.SettlementID))
+                {
+                    processedSettlementIDs.Add(entry.SettlementID);
+                }
+
+                // Original debit/credit line
+                if (entry.Debit > 0)
+                {
+                    journalEntry.Lines.AccountCode = entry.AccountCode;
+                    journalEntry.Lines.Debit = entry.Debit;
+                    journalEntry.Lines.Credit = 0;
+                    journalEntry.Lines.LineMemo = entry.SettlementID;
+                    journalEntry.Lines.CostingCode = "Z-AMAZON";
+                    
+                    if (!string.IsNullOrEmpty(entry.ShortName))
+                    {
+                        journalEntry.Lines.ShortName = entry.ShortName;
+                    }
+                    
+                    journalEntry.Lines.Add();
+
+                    // Compensation credit line to customer account
+                    journalEntry.Lines.ShortName = "C000138"; // Customer account
+                    journalEntry.Lines.Debit = 0;
+                    journalEntry.Lines.Credit = entry.Debit;
+                    journalEntry.Lines.LineMemo = entry.SettlementID;
+                    journalEntry.Lines.CostingCode = "Z-AMAZON";
+                    journalEntry.Lines.Add();
+                }
+                else if (entry.Credit > 0)
+                {
+                    journalEntry.Lines.AccountCode = entry.AccountCode;
+                    journalEntry.Lines.Debit = 0;
+                    journalEntry.Lines.Credit = entry.Credit;
+                    journalEntry.Lines.LineMemo = entry.SettlementID;
+                    journalEntry.Lines.CostingCode = "Z-AMAZON";
+                    
+                    if (!string.IsNullOrEmpty(entry.ShortName))
+                    {
+                        journalEntry.Lines.ShortName = entry.ShortName;
+                    }
+                    
+                    journalEntry.Lines.Add();
+
+                    // Compensation debit line to customer account
+                    journalEntry.Lines.ShortName = "C000138"; // Customer account
+                    journalEntry.Lines.Debit = entry.Credit;
+                    journalEntry.Lines.Credit = 0;
+                    journalEntry.Lines.LineMemo = entry.SettlementID;
+                    journalEntry.Lines.CostingCode = "Z-AMAZON";
+                    journalEntry.Lines.Add();
+                }
+            }
+
+            await SendRealTimeUpdate(signalRMessages, connectionId, "SAVING_DOCUMENT", 
+                "Saving journal entry to SAP", batchId, journalRequest.SettlementIDs?.FirstOrDefault());
+
+            // Add the journal entry to SAP
+            int addResult = journalEntry.Add();
+            
+            if (addResult == 0)
+            {
+                string documentEntry = company.GetNewObjectKey();
+                log.LogInformation($"Journal entry created successfully. DocumentEntry: {documentEntry}, BatchId: {batchId}");
+                
+                return new SAPOperationResult 
+                { 
+                    Success = true, 
+                    DocumentEntry = documentEntry 
+                };
+            }
+            else
+            {
+                string error = company.GetLastErrorDescription();
+                log.LogError($"Failed to create journal entry in SAP: {error}, BatchId: {batchId}");
+                
+                return new SAPOperationResult 
+                { 
+                    Success = false, 
+                    ErrorMessage = error 
+                };
+            }
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Exception in CreateJournalEntryInSAP for BatchId {batchId}: {ex.Message}");
+            return new SAPOperationResult { Success = false, ErrorMessage = ex.Message };
+        }
+        finally
+        {
+            // Clean up SAP connection
+            if (company != null)
+            {
+                if (company.Connected)
+                {
+                    company.Disconnect();
+                }
+                System.Runtime.InteropServices.Marshal.ReleaseComObject(company);
+            }
+        }
+    }
+
+    private static async Task SendRealTimeUpdate(IAsyncCollector<SignalRMessage> signalRMessages, string connectionId, 
+        string status, string message, string batchId, string settlementId)
+    {
+        try
+        {
+            if (signalRMessages != null && !string.IsNullOrEmpty(connectionId))
+            {
+                var notification = new
+                {
+                    batchId = batchId,
+                    settlementId = settlementId,
+                    status = status,
+                    message = message,
+                    timestamp = DateTime.UtcNow
+                };
+
+                await signalRMessages.AddAsync(new SignalRMessage
+                {
+                    ConnectionId = connectionId,
+                    Target = "journalStatusUpdate",
+                    Arguments = new[] { notification }
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to send real-time update: {ex.Message}");
+        }
+    }
+
+    // Utility methods
+    private static List<List<JournalEntry>> SplitIntoBatches(List<JournalEntry> entries, int batchSize)
+    {
+        var batches = new List<List<JournalEntry>>();
+        
+        for (int i = 0; i < entries.Count; i += batchSize)
+        {
+            batches.Add(entries.Skip(i).Take(batchSize).ToList());
+        }
+        
+        return batches;
+    }
+
+    private static BatchProcessingResult CompileBatchResults(List<BatchProcessingResult> batchResults, string batchId)
+    {
+        var finalResult = new BatchProcessingResult();
+        
+        foreach (var result in batchResults)
+        {
+            finalResult.TotalEntries += result.TotalEntries;
+            finalResult.SuccessfulEntries += result.SuccessfulEntries;
+            finalResult.FailedEntries += result.FailedEntries;
+            finalResult.DocumentEntries.AddRange(result.DocumentEntries);
+            finalResult.FailedDetails.AddRange(result.FailedDetails);
+        }
+
+        finalResult.Success = finalResult.FailedEntries == 0;
+        
+        if (finalResult.Success)
+        {
+            finalResult.Message = $"All {finalResult.TotalEntries} journal entries processed successfully";
+        }
+        else if (finalResult.SuccessfulEntries > 0)
+        {
+            finalResult.Message = $"Processed {finalResult.SuccessfulEntries} of {finalResult.TotalEntries} journal entries successfully";
+        }
+        else
+        {
+            finalResult.Message = $"Failed to process all {finalResult.TotalEntries} journal entries";
+        }
+
+        return finalResult;
+    }
+
+    // Placeholder implementations for database operations
+    private static async Task<AccountValidationResult> ValidateAccountCode(string accountCode, ILogger log)
+    {
+        // TODO: Implement actual account code validation against SAP or database
+        await Task.Delay(10);
+        
+        // Example validation logic
+        if (string.IsNullOrEmpty(accountCode))
+        {
+            return new AccountValidationResult { IsValid = false, Message = "Account code is empty" };
+        }
+
+        // Simulate validation - in real implementation, check against SAP chart of accounts
+        return new AccountValidationResult { IsValid = true, Message = "Account code is valid" };
+    }
+
+    private static async Task UpdateSettlementStatus(List<JournalEntry> entries, string documentEntry, ILogger log)
+    {
+        // TODO: Implement actual database update for settlement status
+        var settlementIDs = entries.Where(e => !string.IsNullOrEmpty(e.SettlementID))
+                                 .Select(e => e.SettlementID)
+                                 .Distinct()
+                                 .ToList();
+
+        foreach (var settlementId in settlementIDs)
+        {
+            log.LogInformation($"Updating settlement {settlementId} with journal entry {documentEntry}");
+            // Actual database update would go here
+        }
+
+        await Task.Delay(10);
+    }
+
+    private static async Task<JournalEntryStatus> GetJournalEntryStatusFromDatabase(string batchId, ILogger log)
+    {
+        // TODO: Implement actual database query
+        await Task.Delay(10);
+        return new JournalEntryStatus 
+        { 
+            Status = "UNKNOWN", 
+            LastUpdated = DateTime.UtcNow 
+        };
+    }
+}
+
+// Request and Result classes
+public class JournalEntriesRequest
+{
+    public DateTime EntryDate { get; set; }
+    public List<JournalEntry> JournalEntries { get; set; }
+    public List<string> SettlementIDs { get; set; }
+    public bool ProcessInBatches { get; set; } = true;
+    public int BatchSize { get; set; } = 50;
+    public string Comments { get; set; }
+}
+
+public class JournalEntry
+{
+    public string AccountCode { get; set; }
+    public string ShortName { get; set; }
+    public double Debit { get; set; }
+    public double Credit { get; set; }
+    public string SettlementID { get; set; }
+    public string LineMemo { get; set; }
+}
+
+public class FinancialValidationResult
+{
+    public bool IsValid { get; set; }
+    public List<string> Errors { get; set; }
+    public List<string> Warnings { get; set; }
+}
+
+public class AccountValidationResult
+{
+    public bool IsValid { get; set; }
+    public string Message { get; set; }
+}
+
+public class BatchProcessingResult
+{
+    public int TotalEntries { get; set; }
+    public int SuccessfulEntries { get; set; }
+    public int FailedEntries { get; set; }
+    public List<string> DocumentEntries { get; set; } = new List<string>();
+    public List<string> FailedDetails { get; set; } = new List<string>();
+    public string Message { get; set; }
+    public bool Success => FailedEntries == 0;
+}
+
+public class SAPOperationResult
+{
+    public bool Success { get; set; }
+    public string DocumentEntry { get; set; }
+    public string ErrorMessage { get; set; }
+}
+
+public class JournalEntryStatus
+{
+    public string Status { get; set; }
+    public int TotalEntries { get; set; }
+    public int SuccessfulEntries { get; set; }
+    public int FailedEntries { get; set; }
+    public List<string> DocumentEntries { get; set; } = new List<string>();
+    public List<string> ErrorMessages { get; set; } = new List<string>();
+    public DateTime LastUpdated { get; set; }
+}
+
+{
+  "bindings": [
+    {
+      "authLevel": "function",
+      "name": "req",
+      "type": "httpTrigger",
+      "direction": "in",
+      "methods": [
+        "post"
+      ],
+      "route": "journalentries/create"
+    },
+    {
+      "name": "$return",
+      "type": "http",
+      "direction": "out"
+    },
+    {
+      "type": "signalR",
+      "name": "signalRMessages",
+      "hubName": "journalNotifications",
+      "connectionStringSetting": "AzureSignalRConnectionString",
+      "direction": "out"
+    }
+  ],
+  "scriptFile": "UpLoadV2_JournalEntries.csx",
+  "disabled": false
+}

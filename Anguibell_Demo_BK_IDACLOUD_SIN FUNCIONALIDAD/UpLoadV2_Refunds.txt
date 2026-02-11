@@ -1,0 +1,576 @@
+using System;
+using System.Net;
+using System.Net.Http;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.WebJobs;
+using Microsoft.Azure.WebJobs.Extensions.Http;
+using Microsoft.Azure.WebJobs.Extensions.SignalRService;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
+using SAPbobsCOM;
+using System.Data;
+using System.Collections.Generic;
+using Polly;
+using System.Threading;
+using System.Linq;
+
+public static class UpLoadV2_Refunds
+{
+    private static readonly AsyncRetryPolicy _retryPolicy = Policy
+        .Handle<Exception>()
+        .WaitAndRetryAsync(
+            retryCount: 3,
+            sleepDurationProvider: retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
+            onRetry: (exception, timeSpan, retryCount, context) =>
+            {
+                var logger = (ILogger)context["logger"];
+                logger.LogWarning($"Retry {retryCount} for SAP connection after {timeSpan} due to: {exception.Message}");
+            });
+
+    [FunctionName("ProcessRefund")]
+    public static async Task<IActionResult> ProcessRefund(
+        [HttpTrigger(AuthorizationLevel.Function, "post", Route = "refunds/process")] HttpRequest req,
+        [SignalR(HubName = "refundNotifications")] IAsyncCollector<SignalRMessage> signalRMessages,
+        ILogger log)
+    {
+        log.LogInformation("C# HTTP trigger function processed a request for refund processing.");
+
+        string connectionId = req.Headers["X-SignalR-ConnectionId"];
+        
+        try
+        {
+            // Parse request body
+            string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+            var refundData = JsonConvert.DeserializeObject<RefundRequest>(requestBody);
+
+            // Send initial status update
+            await SendRealTimeUpdate(signalRMessages, connectionId, "PROCESSING", "Starting refund processing", refundData.RefundId);
+
+            // Check idempotence - prevent duplicate processing
+            var idempotenceCheck = await CheckIdempotence(refundData, log);
+            if (idempotenceCheck.IsDuplicate)
+            {
+                await SendRealTimeUpdate(signalRMessages, connectionId, "DUPLICATE", 
+                    $"Refund already processed with DocumentEntry: {idempotenceCheck.ExistingDocumentEntry}", refundData.RefundId);
+                
+                return new OkObjectResult(new { 
+                    status = "DUPLICATE", 
+                    message = "Refund already processed",
+                    documentEntry = idempotenceCheck.ExistingDocumentEntry
+                });
+            }
+
+            // Validate data against central database
+            var validationResult = await ValidateRefundData(refundData, log);
+            if (!validationResult.IsValid)
+            {
+                await SendRealTimeUpdate(signalRMessages, connectionId, "VALIDATION_FAILED", 
+                    string.Join("; ", validationResult.Errors), refundData.RefundId);
+                
+                return new BadRequestObjectResult(new { 
+                    error = "Data validation failed", 
+                    details = validationResult.Errors 
+                });
+            }
+
+            await SendRealTimeUpdate(signalRMessages, connectionId, "VALIDATING", "Data validation successful", refundData.RefundId);
+
+            // Execute SAP operation with retry policy
+            var context = new Context
+            {
+                { "logger", log },
+                { "operation", "CreateCreditNote" },
+                { "signalRMessages", signalRMessages },
+                { "connectionId", connectionId },
+                { "refundId", refundData.RefundId }
+            };
+
+            var result = await _retryPolicy.ExecuteAsync(async (ctx) =>
+            {
+                await SendRealTimeUpdate(signalRMessages, connectionId, "CONNECTING_SAP", "Connecting to SAP Business One", refundData.RefundId);
+                return await CreateCreditNoteInSAP(refundData, log, signalRMessages, connectionId);
+            }, context);
+
+            // Send final notification
+            if (result.Success)
+            {
+                await MarkRefundAsProcessed(refundData, result.DocumentEntry, log);
+                await SendRealTimeUpdate(signalRMessages, connectionId, "COMPLETED", 
+                    $"Credit note created successfully. DocumentEntry: {result.DocumentEntry}", refundData.RefundId);
+                
+                return new OkObjectResult(new { 
+                    message = "Credit note created successfully", 
+                    documentEntry = result.DocumentEntry,
+                    timestamp = DateTime.UtcNow,
+                    refundId = refundData.RefundId
+                });
+            }
+            else
+            {
+                await SendRealTimeUpdate(signalRMessages, connectionId, "FAILED", 
+                    $"Failed to create credit note: {result.ErrorMessage}", refundData.RefundId);
+                
+                return new ObjectResult(new { 
+                    error = "Failed to create credit note in SAP", 
+                    details = result.ErrorMessage 
+                })
+                {
+                    StatusCode = 500
+                };
+            }
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Unhandled exception in ProcessRefund: {ex.Message}");
+            await SendRealTimeUpdate(signalRMessages, connectionId, "ERROR", 
+                $"Unhandled exception: {ex.Message}", "unknown");
+            
+            return new ObjectResult(new { error = "Internal server error", details = ex.Message })
+            {
+                StatusCode = 500
+            };
+        }
+    }
+
+    [FunctionName("GetRefundStatus")]
+    public static async Task<IActionResult> GetRefundStatus(
+        [HttpTrigger(AuthorizationLevel.Function, "get", Route = "refunds/status/{refundId}")] HttpRequest req,
+        string refundId,
+        ILogger log)
+    {
+        try
+        {
+            // TODO: Implement status check from central database
+            var status = await GetRefundStatusFromDatabase(refundId, log);
+            
+            return new OkObjectResult(new {
+                refundId = refundId,
+                status = status.Status,
+                documentEntry = status.DocumentEntry,
+                lastUpdated = status.LastUpdated,
+                errorMessage = status.ErrorMessage
+            });
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Error getting refund status: {ex.Message}");
+            return new ObjectResult(new { error = "Error retrieving refund status" })
+            {
+                StatusCode = 500
+            };
+        }
+    }
+
+    [FunctionName("negotiate")]
+    public static SignalRConnectionInfo Negotiate(
+        [HttpTrigger(AuthorizationLevel.Anonymous)] HttpRequest req,
+        [SignalRConnectionInfo(HubName = "refundNotifications")] SignalRConnectionInfo connectionInfo)
+    {
+        return connectionInfo;
+    }
+
+    private static async Task<IdempotenceCheckResult> CheckIdempotence(RefundRequest refundData, ILogger log)
+    {
+        try
+        {
+            // TODO: Implement actual idempotence check against central database
+            // Use unique identifiers like OrderItemId + RefundId to prevent duplicates
+            
+            // Placeholder implementation
+            bool isDuplicate = await CheckIfRefundExists(refundData.RefundId, refundData.OrderItems.Select(oi => oi.OrderItemId).ToList(), log);
+            string existingDocumentEntry = isDuplicate ? await GetExistingDocumentEntry(refundData.RefundId, log) : null;
+
+            return new IdempotenceCheckResult 
+            { 
+                IsDuplicate = isDuplicate, 
+                ExistingDocumentEntry = existingDocumentEntry 
+            };
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Idempotence check error: {ex.Message}");
+            return new IdempotenceCheckResult { IsDuplicate = false };
+        }
+    }
+
+    private static async Task<ValidationResult> ValidateRefundData(RefundRequest refundData, ILogger log)
+    {
+        try
+        {
+            var errors = new List<string>();
+
+            // Basic validation
+            if (string.IsNullOrEmpty(refundData.AmazonOrderId))
+                errors.Add("AmazonOrderId is required");
+
+            if (string.IsNullOrEmpty(refundData.RefundId))
+                errors.Add("RefundId is required");
+
+            if (refundData.OrderItems == null || !refundData.OrderItems.Any())
+                errors.Add("At least one order item is required");
+
+            // Validate each order item has required fields
+            if (refundData.OrderItems != null)
+            {
+                foreach (var item in refundData.OrderItems)
+                {
+                    if (string.IsNullOrEmpty(item.OrderItemId))
+                        errors.Add("OrderItemId is required for all items");
+
+                    if (string.IsNullOrEmpty(item.SellerSKU))
+                        errors.Add("SellerSKU is required for all items");
+
+                    if (item.QuantityShipped <= 0)
+                        errors.Add("QuantityShipped must be greater than 0");
+                }
+            }
+
+            // TODO: Add business rule validations
+            // - Check if original order exists
+            // - Validate refund amounts against original order
+            // - Check if refund is within acceptable time window
+
+            await Task.Delay(50); // Simulate async validation
+
+            return new ValidationResult 
+            { 
+                IsValid = !errors.Any(), 
+                Errors = errors 
+            };
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Validation error: {ex.Message}");
+            return new ValidationResult 
+            { 
+                IsValid = false, 
+                Errors = new List<string> { $"Validation error: {ex.Message}" } 
+            };
+        }
+    }
+
+    private static async Task<SAPOperationResult> CreateCreditNoteInSAP(RefundRequest refundData, ILogger log, 
+        IAsyncCollector<SignalRMessage> signalRMessages, string connectionId)
+    {
+        Company company = null;
+        
+        try
+        {
+            await SendRealTimeUpdate(signalRMessages, connectionId, "CREATING_DOCUMENT", "Creating credit note document in SAP", refundData.RefundId);
+
+            // Initialize SAP connection using shared configuration
+            company = await SAPConnectionService.ConnectToSAP(log);
+            if (company == null || !company.Connected)
+            {
+                return new SAPOperationResult { Success = false, ErrorMessage = "Failed to connect to SAP" };
+            }
+
+            // Create credit note document
+            Documents creditNote = (Documents)company.GetBusinessObject(BoObjectTypes.oCreditNotes);
+            
+            // Configure document header
+            creditNote.CardCode = "C000138";
+            creditNote.DocDate = refundData.PostedDate;
+            creditNote.DocDueDate = refundData.PostedDate;
+            creditNote.NumAtCard = refundData.AmazonOrderId;
+            creditNote.Comments = $"Refund - {refundData.AmazonOrderId} - {refundData.RefundId}";
+            creditNote.TaxDate = refundData.PostedDate;
+            
+            // Set user fields
+            creditNote.UserFields.Fields.Item("U_CTS_Whs").Value = "AMAZON";
+            creditNote.UserFields.Fields.Item("U_CTS_SCH").Value = refundData.PostedDate;
+            creditNote.UserFields.Fields.Item("U_ZSPS_SchedDelDt").Value = refundData.PostedDate;
+            creditNote.UserFields.Fields.Item("U_CTS_Risk").Value = "NF";
+            creditNote.UserFields.Fields.Item("U_CTS_Consolnum").Value = "*";
+
+            await SendRealTimeUpdate(signalRMessages, connectionId, "ADDING_ITEMS", "Adding order items to credit note", refundData.RefundId);
+
+            // Add order items
+            int itemCount = 0;
+            foreach (var orderItem in refundData.OrderItems)
+            {
+                itemCount++;
+                await SendRealTimeUpdate(signalRMessages, connectionId, "PROCESSING_ITEM", 
+                    $"Processing item {itemCount} of {refundData.OrderItems.Count}", refundData.RefundId);
+
+                creditNote.Lines.ItemCode = orderItem.SellerSKU;
+                creditNote.Lines.Quantity = orderItem.QuantityShipped;
+                creditNote.Lines.Price = Math.Round(orderItem.PriceAdj, 2);
+
+                // Ensure price is not zero to avoid SAP issues
+                if (creditNote.Lines.Price == 0)
+                {
+                    creditNote.Lines.Price = 0.01;
+                }
+
+                creditNote.Lines.FreeText = refundData.AmazonOrderId;
+                
+                if (!string.IsNullOrEmpty(orderItem.OrderItemId))
+                {
+                    try
+                    {
+                        creditNote.Lines.SerialNum = orderItem.OrderItemId;
+                    }
+                    catch (Exception ex)
+                    {
+                        log.LogWarning($"Could not set SerialNum for OrderItemId {orderItem.OrderItemId}: {ex.Message}");
+                    }
+                }
+                
+                creditNote.Lines.WarehouseCode = "AMAZON";
+                creditNote.Lines.COGSAccountCode = refundData.Type == "Sales" ? "5654-0.8" : "5654-0.6";
+
+                // Add expenses if applicable
+                if (orderItem.ChargeAmount != 0)
+                {
+                    creditNote.Lines.Expenses.ExpenseCode = refundData.Type == "Sales" ? 23 : 24;
+                    creditNote.Lines.Expenses.LineTotal = Math.Round(orderItem.ChargeAmount, 2);
+                    creditNote.Lines.Expenses.Add();
+                }
+
+                // Add promotional rebates
+                if (orderItem.PromotionalRebates != 0)
+                {
+                    creditNote.Lines.Expenses.ExpenseCode = 25;
+                    creditNote.Lines.Expenses.LineTotal = Math.Round(orderItem.PromotionalRebates, 2);
+                    creditNote.Lines.Expenses.Add();
+                }
+
+                // Add shipping credits
+                if (orderItem.ShippingCredits != 0)
+                {
+                    creditNote.Lines.Expenses.ExpenseCode = 26;
+                    creditNote.Lines.Expenses.LineTotal = Math.Round(orderItem.ShippingCredits, 2);
+                    creditNote.Lines.Expenses.Add();
+                }
+
+                creditNote.Lines.Add();
+            }
+
+            await SendRealTimeUpdate(signalRMessages, connectionId, "SAVING_DOCUMENT", "Saving credit note to SAP", refundData.RefundId);
+
+            // Add the document to SAP
+            int addResult = creditNote.Add();
+            
+            if (addResult == 0)
+            {
+                string documentEntry = company.GetNewObjectKey();
+                log.LogInformation($"Credit note created successfully. DocumentEntry: {documentEntry}, RefundId: {refundData.RefundId}");
+                
+                return new SAPOperationResult 
+                { 
+                    Success = true, 
+                    DocumentEntry = documentEntry 
+                };
+            }
+            else
+            {
+                string error = company.GetLastErrorDescription();
+                log.LogError($"Failed to create credit note in SAP: {error}, RefundId: {refundData.RefundId}");
+                
+                return new SAPOperationResult 
+                { 
+                    Success = false, 
+                    ErrorMessage = error 
+                };
+            }
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Exception in CreateCreditNoteInSAP for RefundId {refundData.RefundId}: {ex.Message}");
+            return new SAPOperationResult { Success = false, ErrorMessage = ex.Message };
+        }
+        finally
+        {
+            // Clean up SAP connection
+            if (company != null)
+            {
+                if (company.Connected)
+                {
+                    company.Disconnect();
+                }
+                System.Runtime.InteropServices.Marshal.ReleaseComObject(company);
+            }
+        }
+    }
+
+    private static async Task SendRealTimeUpdate(IAsyncCollector<SignalRMessage> signalRMessages, string connectionId, 
+        string status, string message, string refundId)
+    {
+        try
+        {
+            if (signalRMessages != null && !string.IsNullOrEmpty(connectionId))
+            {
+                var notification = new
+                {
+                    refundId = refundId,
+                    status = status,
+                    message = message,
+                    timestamp = DateTime.UtcNow
+                };
+
+                await signalRMessages.AddAsync(new SignalRMessage
+                {
+                    ConnectionId = connectionId,
+                    Target = "refundStatusUpdate",
+                    Arguments = new[] { notification }
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            // Log but don't throw - real-time updates are secondary to main functionality
+            Console.WriteLine($"Failed to send real-time update: {ex.Message}");
+        }
+    }
+
+    // Placeholder implementations for database operations
+    private static async Task<bool> CheckIfRefundExists(string refundId, List<string> orderItemIds, ILogger log)
+    {
+        // TODO: Implement actual database check
+        await Task.Delay(10);
+        return false;
+    }
+
+    private static async Task<string> GetExistingDocumentEntry(string refundId, ILogger log)
+    {
+        // TODO: Implement actual database lookup
+        await Task.Delay(10);
+        return null;
+    }
+
+    private static async Task MarkRefundAsProcessed(RefundRequest refundData, string documentEntry, ILogger log)
+    {
+        // TODO: Implement actual database update
+        await Task.Delay(10);
+        log.LogInformation($"Refund {refundData.RefundId} marked as processed with DocumentEntry: {documentEntry}");
+    }
+
+    private static async Task<RefundStatus> GetRefundStatusFromDatabase(string refundId, ILogger log)
+    {
+        // TODO: Implement actual database query
+        await Task.Delay(10);
+        return new RefundStatus 
+        { 
+            Status = "UNKNOWN", 
+            LastUpdated = DateTime.UtcNow 
+        };
+    }
+}
+
+// Shared SAP Connection Service
+public static class SAPConnectionService
+{
+    public static async Task<Company> ConnectToSAP(ILogger log)
+    {
+        Company company = new Company();
+        
+        try
+        {
+            // Configure SAP connection from environment variables
+            company.Server = Environment.GetEnvironmentVariable("SAP_Server") ?? "COPAHANA:30015";
+            company.LicenseServer = Environment.GetEnvironmentVariable("SAP_LicenseServer") ?? "COPAHANA:40000";
+            company.CompanyDB = Environment.GetEnvironmentVariable("SAP_CompanyDB") ?? "SBO_COPA_LIVE";
+            company.UserName = Environment.GetEnvironmentVariable("SAP_UserName") ?? "manager";
+            company.Password = Environment.GetEnvironmentVariable("SAP_Password") ?? "SAP2018";
+            company.DbUserName = Environment.GetEnvironmentVariable("SAP_DbUserName") ?? "SYSTEM";
+            company.DbPassword = Environment.GetEnvironmentVariable("SAP_DbPassword") ?? "SAPB1Admin";
+            company.language = BoSuppLangs.ln_English;
+            company.DbServerType = BoDataServerTypes.dst_HANADB;
+
+            int connectionResult = company.Connect();
+            if (connectionResult != 0)
+            {
+                string error = company.GetLastErrorDescription();
+                log.LogError($"SAP connection failed: {error}");
+                return null;
+            }
+
+            return company;
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Exception during SAP connection: {ex.Message}");
+            return null;
+        }
+    }
+}
+
+// Request and Result classes
+public class RefundRequest
+{
+    public string AmazonOrderId { get; set; }
+    public DateTime PostedDate { get; set; }
+    public string Type { get; set; }
+    public string RefundId { get; set; }
+    public string ID_UNIQUE { get; set; }
+    public List<RefundOrderItem> OrderItems { get; set; }
+}
+
+public class RefundOrderItem
+{
+    public string SellerSKU { get; set; }
+    public double QuantityShipped { get; set; }
+    public double PriceAdj { get; set; }
+    public double ChargeAmount { get; set; }
+    public double PromotionalRebates { get; set; }
+    public double ShippingCredits { get; set; }
+    public string OrderItemId { get; set; }
+}
+
+public class IdempotenceCheckResult
+{
+    public bool IsDuplicate { get; set; }
+    public string ExistingDocumentEntry { get; set; }
+}
+
+public class ValidationResult
+{
+    public bool IsValid { get; set; }
+    public List<string> Errors { get; set; }
+}
+
+public class SAPOperationResult
+{
+    public bool Success { get; set; }
+    public string DocumentEntry { get; set; }
+    public string ErrorMessage { get; set; }
+}
+
+public class RefundStatus
+{
+    public string Status { get; set; }
+    public string DocumentEntry { get; set; }
+    public DateTime LastUpdated { get; set; }
+    public string ErrorMessage { get; set; }
+}
+{
+  "bindings": [
+    {
+      "authLevel": "function",
+      "name": "req",
+      "type": "httpTrigger",
+      "direction": "in",
+      "methods": [
+        "post"
+      ],
+      "route": "refunds/process"
+    },
+    {
+      "name": "$return",
+      "type": "http",
+      "direction": "out"
+    },
+    {
+      "type": "signalR",
+      "name": "signalRMessages",
+      "hubName": "refundNotifications",
+      "connectionStringSetting": "AzureSignalRConnectionString",
+      "direction": "out"
+    }
+  ],
+  "scriptFile": "UpLoadV2_Refunds.csx",
+  "disabled": false
+}

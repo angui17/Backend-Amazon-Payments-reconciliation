@@ -1,0 +1,275 @@
+// Amazon2.csx - Descarga reportes de liquidación desde Amazon SP-API
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Http;
+using System.Threading.Tasks;
+using System.Web;
+using Newtonsoft.Json;
+using System.Data.SqlClient;
+
+public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
+{
+    log.Info("C# HTTP trigger function started - Amazon2");
+
+    try
+    {
+        // Configuración desde variables de entorno
+        string clientId = Environment.GetEnvironmentVariable("AmazonClientId");
+        string clientSecret = Environment.GetEnvironmentVariable("AmazonClientSecret");
+        string refreshToken = Environment.GetEnvironmentVariable("AmazonRefreshToken");
+        string sqlConnectionString = Environment.GetEnvironmentVariable("SqlConnectionString");
+
+        if (string.IsNullOrEmpty(clientId) || string.IsNullOrEmpty(clientSecret) || string.IsNullOrEmpty(refreshToken))
+        {
+            return new { error = "Amazon API credentials not configured" };
+        }
+
+        string accessToken = await GetLWAAccessToken(clientId, clientSecret, refreshToken, log);
+        log.Info("Access token obtained successfully");
+
+        var reports = await GetSettlementReports(accessToken, sqlConnectionString, log);
+        
+        if (reports == null || reports.reports == null || reports.reports.Count == 0)
+        {
+            return new { message = "No new settlement reports found" };
+        }
+
+        string downloadPath = Path.Combine(Path.GetTempPath(), "AmazonReports", "SettlementReport");
+        Directory.CreateDirectory(downloadPath);
+        
+        string logPath = Path.Combine(downloadPath, "DownloadedReports.txt");
+        var downloadedReports = LoadDownloadedReports(logPath);
+
+        int downloadedCount = 0;
+        bool flag = true;
+
+        while (flag)
+        {
+            if (reports.reports.Count > 0)
+            {
+                foreach (var report in reports.reports)
+                {
+                    if (report.processingStatus == "DONE")
+                    {
+                        string reportFileName = Path.Combine(downloadPath, $"{report.reportId}.tsv");
+
+                        // Validar si ya fue descargado
+                        if (downloadedReports.Contains(report.reportId))
+                        {
+                            log.Info($"Report {report.reportId} already processed. Skipping...");
+                            continue;
+                        }
+
+                        if (!File.Exists(reportFileName))
+                        {
+                            await Task.Delay(3000); // Rate limiting
+                            string reportUrl = await DownloadReport(accessToken, report.reportDocumentId, log);
+
+                            if (!string.IsNullOrEmpty(reportUrl))
+                            {
+                                await DownloadReportFile(reportUrl, reportFileName, log);
+                                SaveDownloadedReport(logPath, report.reportId);
+                                downloadedCount++;
+                                log.Info($"Report downloaded: {reportFileName}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            string nextToken = reports.NextToken;
+            if (!string.IsNullOrEmpty(nextToken))
+            {
+                reports = await GetSettlementReports(accessToken, sqlConnectionString, log, nextToken);
+            }
+            else
+            {
+                flag = false;
+            }
+        }
+
+        return new { 
+            success = true, 
+            message = $"Downloaded {downloadedCount} settlement reports",
+            downloadedCount = downloadedCount
+        };
+    }
+    catch (Exception ex)
+    {
+        log.Error($"Error in Amazon2: {ex.Message}", ex);
+        return new { error = ex.Message };
+    }
+}
+
+// MÉTODOS AUXILIARES
+private static HashSet<string> LoadDownloadedReports(string logFilePath)
+{
+    if (!File.Exists(logFilePath)) return new HashSet<string>();
+    return new HashSet<string>(File.ReadAllLines(logFilePath));
+}
+
+private static void SaveDownloadedReport(string logFilePath, string reportId)
+{
+    File.AppendAllText(logFilePath, reportId + Environment.NewLine);
+}
+
+private static async Task<string> GetLWAAccessToken(string clientId, string clientSecret, string refreshToken, TraceWriter log)
+{
+    using (var client = new HttpClient())
+    {
+        var requestContent = new FormUrlEncodedContent(new[]
+        {
+            new KeyValuePair<string, string>("grant_type", "refresh_token"),
+            new KeyValuePair<string, string>("refresh_token", refreshToken),
+            new KeyValuePair<string, string>("client_id", clientId),
+            new KeyValuePair<string, string>("client_secret", clientSecret),
+        });
+
+        var response = await client.PostAsync("https://api.amazon.com/auth/o2/token", requestContent);
+        var responseContent = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new ApplicationException($"Failed to obtain LWA Access Token: {responseContent}");
+        }
+
+        var tokenResponse = JsonConvert.DeserializeObject<dynamic>(responseContent);
+        return tokenResponse.access_token;
+    }
+}
+
+private static async Task<ReportResponse> GetSettlementReports(string accessToken, string sqlConnectionString, TraceWriter log, string nextToken = null)
+{
+    using (var client = new HttpClient())
+    {
+        client.DefaultRequestHeaders.Add("x-amz-access-token", accessToken);
+
+        // Obtener última fecha de liquidación procesada desde BD
+        string lastEndDate = await GetLastSettlementDate(sqlConnectionString, log);
+        string formattedDate = null;
+
+        if (!string.IsNullOrEmpty(lastEndDate))
+        {
+            try
+            {
+                DateTime parsedDate = DateTime.ParseExact(lastEndDate, "yyyy-MM-dd HH:mm:ss UTC", System.Globalization.CultureInfo.InvariantCulture);
+                parsedDate = parsedDate.AddMinutes(10);
+                formattedDate = parsedDate.ToString("yyyy-MM-ddTHH:mm:ssZ");
+            }
+            catch (Exception ex)
+            {
+                log.Warning($"Error parsing date {lastEndDate}: {ex.Message}");
+            }
+        }
+
+        string reportType = "GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2";
+        string uri = $"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports?reportTypes={reportType}";
+
+        if (!string.IsNullOrEmpty(formattedDate))
+        {
+            uri += $"&createdSince={formattedDate}";
+        }
+
+        if (!string.IsNullOrEmpty(nextToken))
+        {
+            uri = $"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports?nextToken={nextToken}";
+        }
+
+        log.Info($"Calling Amazon API: {uri}");
+
+        var response = await client.GetAsync(uri);
+        if (response.IsSuccessStatusCode)
+        {
+            var jsonResponse = await response.Content.ReadAsStringAsync();
+            return JsonConvert.DeserializeObject<ReportResponse>(jsonResponse);
+        }
+        else
+        {
+            var errorResponse = await response.Content.ReadAsStringAsync();
+            log.Error($"Amazon API error: {response.StatusCode} - {errorResponse}");
+            return null;
+        }
+    }
+}
+
+private static async Task<string> GetLastSettlementDate(string sqlConnectionString, TraceWriter log)
+{
+    try
+    {
+        using (var connection = new SqlConnection(sqlConnectionString))
+        {
+            await connection.OpenAsync();
+            using (var command = new SqlCommand("CALL CTS_AMAZON_LAST_PAYMENT()", connection))
+            using (var reader = await command.ExecuteReaderAsync())
+            {
+                if (await reader.ReadAsync())
+                {
+                    return reader["settlement-end-date"]?.ToString();
+                }
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        log.Warning($"Error getting last settlement date: {ex.Message}");
+    }
+    return null;
+}
+
+private static async Task<string> DownloadReport(string accessToken, string reportId, TraceWriter log)
+{
+    using (var client = new HttpClient())
+    {
+        client.DefaultRequestHeaders.Add("x-amz-access-token", accessToken);
+        string uri = $"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/documents/{reportId}";
+
+        var response = await client.GetAsync(uri);
+        if (response.IsSuccessStatusCode)
+        {
+            var jsonResponse = await response.Content.ReadAsStringAsync();
+            var reportDocument = JsonConvert.DeserializeObject<ReportDocumentResponse>(jsonResponse);
+            return reportDocument.url;
+        }
+        return null;
+    }
+}
+
+private static async Task DownloadReportFile(string url, string filePath, TraceWriter log)
+{
+    using (var client = new HttpClient())
+    {
+        var response = await client.GetAsync(url);
+        if (response.IsSuccessStatusCode)
+        {
+            var fileBytes = await response.Content.ReadAsByteArrayAsync();
+            File.WriteAllBytes(filePath, fileBytes);
+        }
+    }
+}
+
+// CLASES PARA DESERIALIZACIÓN
+public class Report
+{
+    public string reportId { get; set; }
+    public string reportDocumentId { get; set; }
+    public string reportType { get; set; }
+    public string processingStatus { get; set; }
+    public DateTime createdTime { get; set; }
+}
+
+public class ReportResponse
+{
+    public List<Report> reports { get; set; }
+    public string NextToken { get; set; }
+}
+
+public class ReportDocumentResponse
+{
+    public string reportDocumentId { get; set; }
+    public string url { get; set; }
+}
+{ 
+  "engine": "Worker", 
+  "name": "World"
+}

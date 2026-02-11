@@ -1,0 +1,215 @@
+// LoadAmazonPayments.csx - Crea borradores de pagos en SAP Business One
+using System;
+using System.Collections.Generic;
+using System.Data.SqlClient;
+using System.Threading.Tasks;
+using System.Web;
+using SAPbobsCOM;
+
+public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
+{
+    log.Info("C# HTTP trigger function started - LoadAmazonPayments");
+
+    try
+    {
+        string sqlConnectionString = Environment.GetEnvironmentVariable("SqlConnectionString");
+        string sapConnectionString = Environment.GetEnvironmentVariable("SapConnectionString");
+
+        Company company = new Company();
+        ConfigureSAPConnection(company, sapConnectionString);
+        
+        int ret = company.Connect();
+        if (ret != 0)
+        {
+            return new { error = $"SAP connection failed: {company.GetLastErrorDescription()}" };
+        }
+
+        int processedPayments = 0;
+        int skippedPayments = 0;
+
+        using (var sqlConnection = new SqlConnection(sqlConnectionString))
+        {
+            await sqlConnection.OpenAsync();
+
+            // Obtener headers de pagos pendientes
+            using (var command = new SqlCommand("CALL CTS_AMAZON_HEADER_PAYMENT()", sqlConnection))
+            using (var reader = await command.ExecuteReaderAsync())
+            {
+                while (await reader.ReadAsync())
+                {
+                    string headerId = reader["id"].ToString();
+                    
+                    // Validar si el pago ya existe
+                    if (await PaymentExists(sqlConnection, headerId))
+                    {
+                        log.Info($"Payment {headerId} already exists. Skipping...");
+                        skippedPayments++;
+                        continue;
+                    }
+
+                    // Crear borrador de pago
+                    bool success = await CreatePaymentDraft(company, sqlConnection, headerId, reader, log);
+                    if (success) processedPayments++;
+                }
+            }
+        }
+
+        company.Disconnect();
+
+        return new { 
+            success = true,
+            processedPayments = processedPayments,
+            skippedPayments = skippedPayments,
+            message = $"Processed {processedPayments} payments, skipped {skippedPayments}"
+        };
+    }
+    catch (Exception ex)
+    {
+        log.Error($"Error in LoadAmazonPayments: {ex.Message}", ex);
+        return new { error = ex.Message };
+    }
+}
+
+// MÉTODOS AUXILIARES
+private static async Task<bool> PaymentExists(SqlConnection connection, string headerId)
+{
+    using (var command = new SqlCommand("CALL CTS_AMAZON_VALIDATE_PAYMENT(@headerId)", connection))
+    {
+        command.Parameters.AddWithValue("@headerId", headerId);
+        using (var reader = await command.ExecuteReaderAsync())
+        {
+            if (await reader.ReadAsync())
+            {
+                return Convert.ToBoolean(reader[0]);
+            }
+        }
+    }
+    return false;
+}
+
+private static async Task<bool> CreatePaymentDraft(Company company, SqlConnection sqlConnection, 
+    string headerId, SqlDataReader headerReader, TraceWriter log)
+{
+    try
+    {
+        Payments payment = (Payments)company.GetBusinessObject(BoObjectTypes.oPaymentsDrafts);
+        payment.DocObjectCode = BoPaymentsObjectType.bopot_IncomingPayments;
+
+        // Configurar header del pago
+        payment.CardCode = headerReader["CardCode"].ToString();
+        DateTime depositDate = (DateTime)headerReader["deposit-date"];
+        payment.DocDate = depositDate;
+        payment.DueDate = depositDate;
+        payment.TaxDate = depositDate;
+        payment.JournalRemarks = headerReader["JournalRemarks"].ToString();
+        payment.UserFields.Fields.Item("U_CTS_Source").Value = "AMAZON";
+        payment.TransferAccount = "1107";
+        payment.TransferSum = Convert.ToDouble(headerReader["total-amount"]);
+        payment.TransferDate = depositDate;
+        payment.TransferReference = headerId;
+        payment.UserFields.Fields.Item("U_CTS_SettlementID").Value = headerId;
+        payment.UserFields.Fields.Item("U_CTS_TotalRef").Value = headerReader["total-amount"];
+
+        // Obtener detalles del pago
+        using (var detailCommand = new SqlCommand("CALL CTS_AMAZON_DETAIL_PAYMENT(@headerId)", sqlConnection))
+        {
+            detailCommand.Parameters.AddWithValue("@headerId", headerId);
+            using (var detailReader = await detailCommand.ExecuteReaderAsync())
+            {
+                if (!detailReader.HasRows)
+                {
+                    log.Info($"No documents found for payment {headerId}");
+                    return false;
+                }
+
+                List<string> usedLineIds = new List<string>();
+
+                while (await detailReader.ReadAsync())
+                {
+                    payment.Invoices.DocEntry = Convert.ToInt32(detailReader["DocEntry"]);
+                    string docType = detailReader["DocumentType"].ToString();
+                    payment.Invoices.SumApplied = Convert.ToDouble(detailReader["amount"]);
+
+                    if (docType == "30") // Journal Entry
+                    {
+                        payment.Invoices.DocLine = Convert.ToInt32(detailReader["Line_ID"]);
+                    }
+
+                    // Configurar tipo de documento
+                    switch (docType)
+                    {
+                        case "13":
+                            payment.Invoices.InvoiceType = BoRcptInvTypes.it_Invoice;
+                            break;
+                        case "14":
+                            payment.Invoices.InvoiceType = BoRcptInvTypes.it_CredItnote;
+                            break;
+                        case "30":
+                            payment.Invoices.InvoiceType = BoRcptInvTypes.it_JournalEntry;
+                            break;
+                    }
+
+                    payment.Invoices.Add();
+                    usedLineIds.Add(detailReader["Line_ID"].ToString());
+                }
+
+                // Crear el borrador de pago
+                int result = payment.Add();
+                if (result != 0)
+                {
+                    log.Error($"Payment creation failed for {headerId}: {company.GetLastErrorDescription()}");
+                    return false;
+                }
+
+                log.Info($"Payment draft created successfully for {headerId}");
+                return true;
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        log.Error($"Error creating payment draft {headerId}: {ex.Message}");
+        return false;
+    }
+}
+
+private static void ConfigureSAPConnection(Company company, string connectionString)
+{
+    var parameters = connectionString.Split(';');
+    foreach (var param in parameters)
+    {
+        var keyValue = param.Split('=');
+        if (keyValue.Length == 2)
+        {
+            switch (keyValue[0].ToLower())
+            {
+                case "server":
+                    company.Server = keyValue[1];
+                    break;
+                case "companydb":
+                    company.CompanyDB = keyValue[1];
+                    break;
+                case "username":
+                    company.UserName = keyValue[1];
+                    break;
+                case "password":
+                    company.Password = keyValue[1];
+                    break;
+                case "dbusername":
+                    company.DbUserName = keyValue[1];
+                    break;
+                case "dbpassword":
+                    company.DbPassword = keyValue[1];
+                    break;
+            }
+        }
+    }
+    
+    company.LicenseServer = "COPAHANA:40000";
+    company.language = BoSuppLangs.ln_English;
+    company.DbServerType = BoDataServerTypes.dst_HANADB;
+}v
+{ 
+  "engine": "Worker", 
+  "name": "World"
+}

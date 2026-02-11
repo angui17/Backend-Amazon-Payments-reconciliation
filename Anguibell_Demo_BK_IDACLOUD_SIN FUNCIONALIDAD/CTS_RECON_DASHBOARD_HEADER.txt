@@ -1,0 +1,76 @@
+using System;
+using System.Data.Odbc;
+using Newtonsoft.Json.Linq;
+
+string resultJson = "";
+
+string fecha_desde = InputJson["fecha_desde"]?.ToString();
+string fecha_hasta = InputJson["fecha_hasta"]?.ToString();
+string status = InputJson["status"]?.ToString(); // 'P','C','ALL'
+int? limit = InputJson["limit"]?.ToObject<int?>();
+
+int limitRecords = (limit.HasValue && limit.Value > 0) ? limit.Value : 50;
+
+// Default dates
+if (string.IsNullOrEmpty(fecha_desde) && string.IsNullOrEmpty(fecha_hasta))
+{
+    fecha_desde = "01-01-2000";
+    fecha_hasta = DateTime.Now.ToString("MM-dd-yyyy");
+}
+
+if (string.IsNullOrWhiteSpace(status))
+{
+    status = "ALL";
+}
+status = status.Trim().ToUpper();
+
+using (var connection = new OdbcConnection("{ConnectionString}"))
+{
+    connection.Open();
+
+    using (var command = new OdbcCommand("{ CALL \"CTS_RECON_DASHBOARD_HEADER\"( ?, ?, ?, ? ) }", connection))
+    {
+        command.Parameters.Add("fecha_desde", OdbcType.VarChar).Value = fecha_desde;
+        command.Parameters.Add("fecha_hasta", OdbcType.VarChar).Value = fecha_hasta;
+        command.Parameters.Add("p_status", OdbcType.VarChar).Value = status;
+        command.Parameters.Add("limit_records", OdbcType.Int).Value = limitRecords;
+
+        using (var reader = command.ExecuteReader())
+        {
+            if (reader.Read())
+            {
+                resultJson = reader.GetString(0);
+            }
+        }
+    }
+}
+
+// Validate response
+if (string.IsNullOrWhiteSpace(resultJson))
+{
+    return new JObject
+    {
+        ["id"] = -500,
+        ["Message"] = "SP no devolvió datos."
+    };
+}
+
+try
+{
+    return JToken.Parse(resultJson);
+}
+catch
+{
+    return new JObject
+    {
+        ["id"] = -501,
+        ["Message"] = "SP devolvió un JSON inválido."
+    };
+}
+{
+  "engine": "Worker",
+  "fecha_desde": "01-01-2000",
+  "fecha_hasta": "01-29-2026",
+  "status": "ALL",
+  "limit": 50
+}

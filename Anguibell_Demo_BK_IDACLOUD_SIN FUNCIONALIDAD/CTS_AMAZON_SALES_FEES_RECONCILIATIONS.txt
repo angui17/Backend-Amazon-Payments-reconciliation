@@ -1,0 +1,86 @@
+using System;
+using System.Data.Odbc;
+using Newtonsoft.Json.Linq;
+
+string resultJson = "";
+
+// REQUIRED
+string typesCsv = InputJson["types"]?.ToString();
+
+// Optional
+string fecha_desde = InputJson["fecha_desde"]?.ToString();
+string fecha_hasta = InputJson["fecha_hasta"]?.ToString();
+int? lastRecords = InputJson["last"]?.ToObject<int?>();
+int limitRecords = lastRecords.HasValue ? lastRecords.Value : 10;
+
+// NOTE: SP already validates typesCsv, but we keep a quick guard too
+if (string.IsNullOrWhiteSpace(typesCsv))
+{
+    return new JObject
+    {
+        ["id"] = -400,
+        ["Message"] = "Parameter 'types' (CSV) is required. Example: { \"types\": \"ADJUSTMENT,AMAZON FEES,SERVICE FEE\", \"last\": 10 }"
+    };
+}
+
+// Default dates if both missing
+if (string.IsNullOrEmpty(fecha_desde) && string.IsNullOrEmpty(fecha_hasta))
+{
+    fecha_desde = "01-01-2000";
+    fecha_hasta = DateTime.Now.ToString("MM-dd-yyyy");
+}
+
+// If last requested, force wide range (keeps your pattern)
+if (lastRecords.HasValue && lastRecords.Value > 0)
+{
+    fecha_desde = "01-01-2000";
+    fecha_hasta = DateTime.Now.ToString("MM-dd-yyyy");
+}
+
+using (var connection = new OdbcConnection("{ConnectionString}"))
+{
+    connection.Open();
+
+    using (var command = new OdbcCommand("{ CALL \"CTS_AMAZON_SALES_FEES_RECONCILIATIONS\"( ?, ?, ?, ? ) }", connection))
+    {
+        command.Parameters.Add("p_types_csv", OdbcType.VarChar).Value = typesCsv;
+        command.Parameters.Add("fecha_desde", OdbcType.VarChar).Value = fecha_desde;
+        command.Parameters.Add("fecha_hasta", OdbcType.VarChar).Value = fecha_hasta;
+        command.Parameters.Add("limit_records", OdbcType.Int).Value = limitRecords;
+
+        using (var reader = command.ExecuteReader())
+        {
+            if (reader.Read())
+                resultJson = reader.GetString(0);
+        }
+    }
+}
+
+if (string.IsNullOrWhiteSpace(resultJson))
+{
+    return new JObject
+    {
+        ["id"] = -500,
+        ["Message"] = "SP no devolvió datos."
+    };
+}
+
+// SP returns JSON array (rows or error array), so parse as JArray
+try
+{
+    return JArray.Parse(resultJson);
+}
+catch
+{
+    return new JObject
+    {
+        ["id"] = -501,
+        ["Message"] = "SP devolvió un JSON inválido."
+    };
+}
+
+{
+  "engine": "Worker",
+  "types": "ADJUSTMENT,AMAZON FEES,FBA INVENTORY FEE,FBA INVENTORY FEE - REVERSAL,FBA TRANSACTION FEES,FEE ADJUSTMENT,LIQUIDATIONS,LIQUIDATIONS ADJUSTMENTS,ORDER_RETROCHARGE,REFUND_RETROCHARGE,SERVICE FEE",
+  "last": 50
+}

@@ -1,0 +1,353 @@
+using System;
+using System.Net;
+using System.Net.Http;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.WebJobs;
+using Microsoft.Azure.WebJobs.Extensions.Http;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
+using SAPbobsCOM;
+using System.Data;
+using System.Collections.Generic;
+using System.ComponentModel;
+using Polly;
+using System.Threading;
+
+public static class UpLoadV2
+{
+    private static readonly AsyncRetryPolicy _retryPolicy = Policy
+        .Handle<Exception>()
+        .WaitAndRetryAsync(
+            retryCount: 3,
+            sleepDurationProvider: retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
+            onRetry: (exception, timeSpan, retryCount, context) =>
+            {
+                // Log retry attempt
+                var logger = (ILogger)context["logger"];
+                logger.LogWarning($"Retry {retryCount} for SAP connection after {timeSpan} due to: {exception.Message}");
+            });
+
+    [FunctionName("UpLoadV2")]
+    public static async Task<IActionResult> Run(
+        [HttpTrigger(AuthorizationLevel.Function, "post", Route = null)] HttpRequest req,
+        ILogger log)
+    {
+        log.LogInformation("C# HTTP trigger function processed a request for UpLoadV2.");
+
+        try
+        {
+            // Parse request body
+            string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+            var data = JsonConvert.DeserializeObject<UploadV2Request>(requestBody);
+
+            // Validate input data
+            var validationResult = await ValidateDataAgainstCentralDatabase(data, log);
+            if (!validationResult.IsValid)
+            {
+                return new BadRequestObjectResult(new { error = "Data validation failed", details = validationResult.Errors });
+            }
+
+            // Execute SAP operation with retry policy
+            var context = new Context
+            {
+                { "logger", log },
+                { "operation", "CreateInvoice" }
+            };
+
+            var result = await _retryPolicy.ExecuteAsync(async (ctx) =>
+            {
+                return await CreateInvoiceInSAP(data, log);
+            }, context);
+
+            // Send notification
+            await SendNotification(result.Success, result.DocumentEntry, result.ErrorMessage, log);
+
+            if (result.Success)
+            {
+                return new OkObjectResult(new { 
+                    message = "Invoice created successfully", 
+                    documentEntry = result.DocumentEntry,
+                    timestamp = DateTime.UtcNow
+                });
+            }
+            else
+            {
+                return new ObjectResult(new { 
+                    error = "Failed to create invoice in SAP", 
+                    details = result.ErrorMessage 
+                })
+                {
+                    StatusCode = 500
+                };
+            }
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Unhandled exception in UpLoadV2: {ex.Message}");
+            await SendNotification(false, null, ex.Message, log);
+            
+            return new ObjectResult(new { error = "Internal server error", details = ex.Message })
+            {
+                StatusCode = 500
+            };
+        }
+    }
+
+    private static async Task<ValidationResult> ValidateDataAgainstCentralDatabase(UploadV2Request data, ILogger log)
+    {
+        try
+        {
+            // TODO: Implement validation against central database
+            // Check for duplicates, validate business rules, etc.
+            
+            // Placeholder validation logic
+            if (string.IsNullOrEmpty(data.AmazonOrderId))
+            {
+                return new ValidationResult { IsValid = false, Errors = new List<string> { "AmazonOrderId is required" } };
+            }
+
+            if (data.OrderItems == null || data.OrderItems.Count == 0)
+            {
+                return new ValidationResult { IsValid = false, Errors = new List<string> { "At least one order item is required" } };
+            }
+
+            // Simulate database validation
+            await Task.Delay(100); // Simulate async database call
+
+            return new ValidationResult { IsValid = true, Errors = new List<string>() };
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Validation error: {ex.Message}");
+            return new ValidationResult { IsValid = false, Errors = new List<string> { $"Validation error: {ex.Message}" } };
+        }
+    }
+
+    private static async Task<SAPOperationResult> CreateInvoiceInSAP(UploadV2Request data, ILogger log)
+    {
+        Company company = null;
+        
+        try
+        {
+            // Initialize SAP connection
+            company = new Company();
+            
+            // Configure SAP connection (should be moved to configuration)
+            company.Server = Environment.GetEnvironmentVariable("SAP_Server") ?? "COPAHANA:30015";
+            company.LicenseServer = Environment.GetEnvironmentVariable("SAP_LicenseServer") ?? "COPAHANA:40000";
+            company.CompanyDB = Environment.GetEnvironmentVariable("SAP_CompanyDB") ?? "SBO_COPA_LIVE";
+            company.UserName = Environment.GetEnvironmentVariable("SAP_UserName") ?? "manager";
+            company.Password = Environment.GetEnvironmentVariable("SAP_Password") ?? "SAP2018";
+            company.DbUserName = Environment.GetEnvironmentVariable("SAP_DbUserName") ?? "SYSTEM";
+            company.DbPassword = Environment.GetEnvironmentVariable("SAP_DbPassword") ?? "SAPB1Admin";
+            company.language = BoSuppLangs.ln_English;
+            company.DbServerType = BoDataServerTypes.dst_HANADB;
+
+            // Connect to SAP
+            int connectionResult = company.Connect();
+            if (connectionResult != 0)
+            {
+                string error = company.GetLastErrorDescription();
+                log.LogError($"SAP connection failed: {error}");
+                return new SAPOperationResult { Success = false, ErrorMessage = error };
+            }
+
+            // Create invoice document
+            Documents invoice = (Documents)company.GetBusinessObject(BoObjectTypes.oInvoices);
+            
+            // Configure document header
+            invoice.CardCode = "C000138";
+            invoice.DocDate = data.PostedDate;
+            invoice.DocDueDate = data.PostedDate;
+            invoice.NumAtCard = data.AmazonOrderId;
+            invoice.Comments = data.AmazonOrderId;
+            invoice.TaxDate = data.PostedDate;
+            
+            // Set user fields
+            invoice.UserFields.Fields.Item("U_CTS_Whs").Value = "AMAZON";
+            invoice.UserFields.Fields.Item("U_CTS_SCH").Value = data.PostedDate;
+            invoice.UserFields.Fields.Item("U_ZSPS_SchedDelDt").Value = data.PostedDate;
+            invoice.UserFields.Fields.Item("U_CTS_Risk").Value = "NF";
+            invoice.UserFields.Fields.Item("U_CTS_Consolnum").Value = "*";
+
+            // Add order items
+            foreach (var orderItem in data.OrderItems)
+            {
+                invoice.Lines.ItemCode = orderItem.SellerSKU;
+                invoice.Lines.Quantity = orderItem.QuantityShipped;
+                invoice.Lines.Price = Math.Round(orderItem.PriceAdj, 2);
+                invoice.Lines.FreeText = data.AmazonOrderId;
+                
+                if (!string.IsNullOrEmpty(orderItem.OrderItemId))
+                {
+                    try
+                    {
+                        invoice.Lines.SerialNum = orderItem.OrderItemId;
+                    }
+                    catch (Exception ex)
+                    {
+                        log.LogWarning($"Could not set SerialNum for OrderItemId {orderItem.OrderItemId}: {ex.Message}");
+                    }
+                }
+                
+                invoice.Lines.WarehouseCode = "AMAZON";
+                invoice.Lines.COGSAccountCode = data.Type == "Sales" ? "5654-0.5" : "5654-0.6";
+
+                // Add expenses if applicable
+                if (orderItem.ChargeAmount != 0)
+                {
+                    invoice.Lines.Expenses.ExpenseCode = data.Type == "Sales" ? 23 : 24;
+                    invoice.Lines.Expenses.LineTotal = Math.Round(orderItem.ChargeAmount, 2);
+                    invoice.Lines.Expenses.Add();
+                }
+
+                // Add promotional rebates
+                if (orderItem.PromotionalRebates != 0)
+                {
+                    invoice.Lines.Expenses.ExpenseCode = 25;
+                    invoice.Lines.Expenses.LineTotal = -Math.Round(orderItem.PromotionalRebates, 2);
+                    invoice.Lines.Expenses.Add();
+                }
+
+                // Add shipping credits
+                if (orderItem.ShippingCredits != 0)
+                {
+                    invoice.Lines.Expenses.ExpenseCode = 26;
+                    invoice.Lines.Expenses.LineTotal = -Math.Round(orderItem.ShippingCredits, 2);
+                    invoice.Lines.Expenses.Add();
+                }
+
+                invoice.Lines.Add();
+            }
+
+            // Add the document to SAP
+            int addResult = invoice.Add();
+            
+            if (addResult == 0)
+            {
+                string documentEntry = company.GetNewObjectKey();
+                log.LogInformation($"Invoice created successfully. DocumentEntry: {documentEntry}");
+                
+                return new SAPOperationResult 
+                { 
+                    Success = true, 
+                    DocumentEntry = documentEntry 
+                };
+            }
+            else
+            {
+                string error = company.GetLastErrorDescription();
+                log.LogError($"Failed to create invoice in SAP: {error}");
+                
+                return new SAPOperationResult 
+                { 
+                    Success = false, 
+                    ErrorMessage = error 
+                };
+            }
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Exception in CreateInvoiceInSAP: {ex.Message}");
+            return new SAPOperationResult { Success = false, ErrorMessage = ex.Message };
+        }
+        finally
+        {
+            // Clean up SAP connection
+            if (company != null && company.Connected)
+            {
+                company.Disconnect();
+            }
+            
+            // Release COM objects
+            if (company != null)
+            {
+                System.Runtime.InteropServices.Marshal.ReleaseComObject(company);
+            }
+        }
+    }
+
+    private static async Task SendNotification(bool success, string documentEntry, string errorMessage, ILogger log)
+    {
+        try
+        {
+            // TODO: Integrate with Azure Notification Hubs or other notification service
+            var notificationPayload = new
+            {
+                success = success,
+                documentEntry = documentEntry,
+                errorMessage = errorMessage,
+                timestamp = DateTime.UtcNow,
+                function = "UpLoadV2"
+            };
+
+            // Placeholder for notification logic
+            // This would typically call Azure Notification Hubs, SendGrid, etc.
+            log.LogInformation($"Notification: {JsonConvert.SerializeObject(notificationPayload)}");
+            
+            await Task.CompletedTask; // Simulate async operation
+        }
+        catch (Exception ex)
+        {
+            log.LogError($"Failed to send notification: {ex.Message}");
+        }
+    }
+}
+
+// Request and Result classes
+public class UploadV2Request
+{
+    public string AmazonOrderId { get; set; }
+    public DateTime PostedDate { get; set; }
+    public string Type { get; set; }
+    public string ID_UNIQUE { get; set; }
+    public List<OrderItem> OrderItems { get; set; }
+}
+
+public class OrderItem
+{
+    public string SellerSKU { get; set; }
+    public double QuantityShipped { get; set; }
+    public double PriceAdj { get; set; }
+    public double ChargeAmount { get; set; }
+    public double PromotionalRebates { get; set; }
+    public double ShippingCredits { get; set; }
+    public string OrderItemId { get; set; }
+}
+
+public class ValidationResult
+{
+    public bool IsValid { get; set; }
+    public List<string> Errors { get; set; }
+}
+
+public class SAPOperationResult
+{
+    public bool Success { get; set; }
+    public string DocumentEntry { get; set; }
+    public string ErrorMessage { get; set; }
+}
+
+{
+  "bindings": [
+    {
+      "authLevel": "function",
+      "name": "req",
+      "type": "httpTrigger",
+      "direction": "in",
+      "methods": [
+        "post"
+      ],
+      "route": "uploadv2"
+    },
+    {
+      "name": "$return",
+      "type": "http",
+      "direction": "out"
+    }
+  ],
+  "scriptFile": "UpLoadV2.csx",
+  "disabled": false
+}
